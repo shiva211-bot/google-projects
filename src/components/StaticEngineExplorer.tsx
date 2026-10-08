@@ -266,6 +266,65 @@ export const StaticEngineExplorer: React.FC<StaticEngineExplorerProps> = ({
             )}
           </div>
 
+          {/* Interprocedural Call-Flow Traces */}
+          {engineData.interproceduralVulnerabilities && engineData.interproceduralVulnerabilities.length > 0 && (
+            <div>
+              <h4 className="text-xs font-semibold text-slate-200 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                <Network className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Interprocedural Taint: Cross-Function Call Graph Paths</span>
+              </h4>
+
+              <div className="space-y-3">
+                {engineData.interproceduralVulnerabilities.map((ipv) => (
+                  <div key={ipv.id} className="p-3.5 rounded-lg bg-indigo-950/20 border border-indigo-500/40 text-xs space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-indigo-300 font-mono">
+                        {ipv.vulnerabilityType} CROSS-FUNCTION TRACE ({ipv.path.length} HOPS)
+                      </span>
+                      <span className={`text-[11px] font-mono px-1.5 py-0.5 rounded border ${
+                        ipv.sanitized
+                          ? 'text-emerald-400 border-emerald-800 bg-emerald-950/40'
+                          : 'text-rose-400 border-rose-800 bg-rose-950/40'
+                      }`}>
+                        {ipv.sanitized ? 'SANITIZED' : 'UNSANITIZED SINK'}
+                      </span>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      {ipv.path.map((step) => (
+                        <div key={step.stepNumber} className="flex items-start gap-2 bg-slate-950 p-2 rounded border border-slate-800/80 font-mono text-[11px]">
+                          <span className={`w-5 h-5 rounded flex items-center justify-center shrink-0 font-bold text-[10px] ${
+                            step.type === 'SOURCE' ? 'bg-amber-950 text-amber-400 border border-amber-800' :
+                            step.type === 'SINK' ? 'bg-rose-950 text-rose-400 border border-rose-800' :
+                            step.type === 'SANITIZER' ? 'bg-cyan-950 text-cyan-400 border border-cyan-800' :
+                            step.type === 'RETURN' ? 'bg-indigo-950 text-indigo-400 border border-indigo-800' :
+                            'bg-slate-800 text-slate-300'
+                          }`}>
+                            {step.stepNumber}
+                          </span>
+                          <div className="flex-1 text-slate-300">
+                            <div className="flex items-center justify-between">
+                              <span className="uppercase text-[10px] font-bold text-slate-300">
+                                {step.type} {step.function ? `(${step.function})` : ''}
+                              </span>
+                              <button
+                                onClick={() => onLineClick(step.line)}
+                                className="text-amber-400 hover:underline text-[10px]"
+                              >
+                                L{step.line}
+                              </button>
+                            </div>
+                            <p className="text-slate-400 text-[10px] mt-0.5">{step.description}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Control Flow Graph Basic Blocks */}
           <div>
             <h4 className="text-xs font-semibold text-slate-200 uppercase tracking-wider mb-2 flex items-center gap-1.5">

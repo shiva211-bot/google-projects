@@ -1,3 +1,5 @@
+import type { InterproceduralTaintVulnerability } from '../interprocedural/types';
+
 export interface SourceLocation {
   line: number;
   column: number;
@@ -106,6 +108,7 @@ export interface ComprehensiveStaticAnalysis {
   tokensCount: number;
   cfg: ControlFlowGraph;
   taintVulnerabilities: TaintVulnerability[];
+  interproceduralVulnerabilities?: InterproceduralTaintVulnerability[];
   halstead: HalsteadMetrics;
   cognitiveComplexity: number;
   cyclomaticComplexity: number;

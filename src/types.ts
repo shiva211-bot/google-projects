@@ -16,6 +16,8 @@ export interface CodeFinding {
   suggestedReplacement?: string;
 }
 
+export type StaticRiskLevel = 'CRITICAL' | 'HIGH' | 'MODERATE' | 'LOW';
+
 export interface CodeMetrics {
   overallScore: number; // 0-100
   securityScore: number; // 0-100
@@ -24,8 +26,7 @@ export interface CodeMetrics {
   efficiencyScore: number; // 0-100
   bigOTime: string;
   bigOSpace: string;
-  estimatedLatencyMs: number;
-  estimatedMemoryMb: number;
+  staticRiskEstimate: StaticRiskLevel;
   cyclomaticComplexity: number;
   rulesPassedPercent: number;
 }

@@ -153,22 +153,29 @@ export const MetricsOverview: React.FC<MetricsOverviewProps> = ({
           </div>
         </div>
 
-        {/* Performance Score */}
+        {/* Static Risk Estimate (Deterministic Heuristic, No Fake Telemetry) */}
         <div className="p-3.5 rounded-lg bg-slate-900/60 border border-slate-800/80 hover:border-slate-700 transition-colors">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-slate-400">Runtime Perf</span>
-            <Gauge className="w-4 h-4 text-cyan-400" />
+            <span className="text-xs font-medium text-slate-400">Static Risk</span>
+            <Gauge className={`w-4 h-4 ${
+              metrics.staticRiskEstimate === 'CRITICAL' ? 'text-rose-400' :
+              metrics.staticRiskEstimate === 'HIGH' ? 'text-amber-400' :
+              metrics.staticRiskEstimate === 'MODERATE' ? 'text-yellow-400' : 'text-emerald-400'
+            }`} />
           </div>
           <div className="mt-2 flex items-baseline gap-1.5">
-            <span className="text-2xl font-bold font-mono text-slate-100">
-              {metrics.performanceScore}
+            <span className={`text-2xl font-bold font-mono ${
+              metrics.staticRiskEstimate === 'CRITICAL' ? 'text-rose-400' :
+              metrics.staticRiskEstimate === 'HIGH' ? 'text-amber-400' :
+              metrics.staticRiskEstimate === 'MODERATE' ? 'text-yellow-400' : 'text-emerald-400'
+            }`}>
+              {metrics.staticRiskEstimate}
             </span>
-            <span className="text-xs text-slate-500 font-mono">/100</span>
           </div>
           <div className="mt-2 text-[11px] text-slate-400 flex items-center gap-1.5">
-            <span className="text-cyan-400 font-mono">~{metrics.estimatedLatencyMs}ms</span>
+            <span className="text-slate-300 font-mono">AST Heuristic</span>
             <span className="text-slate-600">·</span>
-            <span>Est. Latency</span>
+            <span>Static Risk Estimate</span>
           </div>
         </div>
 
@@ -213,15 +220,19 @@ export const MetricsOverview: React.FC<MetricsOverviewProps> = ({
         </div>
       </div>
 
-      {/* Static Analysis Risk Ratings */}
+      {/* Deterministic Static Analysis Risk & Complexity Ratings */}
       <div className="p-3 rounded-lg bg-slate-900/40 border border-slate-800/70 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
         <div className="flex items-center gap-2 text-slate-400">
           <Clock className="w-3.5 h-3.5 text-slate-500" />
-          <span>Latency Risk: <strong className={metrics.estimatedLatencyMs > 200 ? 'text-rose-400' : 'text-emerald-400'}>{metrics.estimatedLatencyMs > 200 ? 'Severe' : 'Nominal'}</strong></span>
+          <span>Static Risk: <strong className={
+            metrics.staticRiskEstimate === 'CRITICAL' ? 'text-rose-400' :
+            metrics.staticRiskEstimate === 'HIGH' ? 'text-amber-400' :
+            metrics.staticRiskEstimate === 'MODERATE' ? 'text-yellow-400' : 'text-emerald-400'
+          }>{metrics.staticRiskEstimate}</strong></span>
         </div>
         <div className="flex items-center gap-2 text-slate-400">
           <Layers className="w-3.5 h-3.5 text-slate-500" />
-          <span>Heap Risk: <strong className={metrics.estimatedMemoryMb > 50 ? 'text-amber-400' : 'text-emerald-400'}>{metrics.estimatedMemoryMb > 50 ? 'Elevated' : 'Nominal'}</strong></span>
+          <span>Rules Passed: <strong className={metrics.rulesPassedPercent === 100 ? 'text-emerald-400' : 'text-amber-400'}>{metrics.rulesPassedPercent}%</strong></span>
         </div>
         <div className="flex items-center gap-2 text-slate-400">
           <Cpu className="w-3.5 h-3.5 text-slate-500" />

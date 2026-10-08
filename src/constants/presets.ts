@@ -223,5 +223,32 @@ func ProcessJobs(ctx context.Context, jobs []string) map[string]int {
 
 	return m.cache
 }`
+  },
+  {
+    id: 'interprocedural-sql-injection',
+    title: 'Interprocedural Flow: 2-Layer Call Boundary',
+    language: 'javascript',
+    filename: 'queryService.js',
+    category: 'security',
+    tags: ['Interprocedural', 'SQL Injection', 'Cross-Function', 'Taint Flow'],
+    description: 'Tracks untrusted HTTP parameter req.query.id flowing across function boundaries: executeRequest(input) -> buildQuery(id) -> template literal -> db.query() sink.',
+    code: `// Function 1: Formats SQL query string using parameter
+function buildQuery(id) {
+  return \`SELECT * FROM users WHERE id = \${id}\`;
+}
+
+// Function 2: Orchestrates request and calls database sink
+function executeRequest(data) {
+  const query = buildQuery(data.id);
+  return db.query(query);
+}
+
+// Ingestion: Untrusted HTTP query parameter encapsulated in object
+const input = {
+  id: req.query.id
+};
+
+// Execution: Dispatches request across 2 function layers
+executeRequest(input);`
   }
 ];

@@ -1,6 +1,7 @@
 import { parseSourceCode } from './ast/parser';
 import { buildControlFlowGraph } from './cfg/controlFlow';
 import { performTaintAnalysis } from './taint/taintTracker';
+import { performInterproceduralTaintAnalysis } from './interprocedural/interproceduralTaint';
 import { calculateHalsteadMetrics, calculateMaintainabilityIndex, calculateCognitiveComplexity } from './metrics/halstead';
 import { runStaticRules } from './rules/ruleRegistry';
 import { ComprehensiveStaticAnalysis, ASTNode } from './ast/types';
@@ -21,8 +22,9 @@ export function executeTrueStaticAnalysis(
   // 2. Control Flow Graph Construction
   const cfg = buildControlFlowGraph(ast);
 
-  // 3. Taint Data Flow Analysis (Source to Sink)
+  // 3. Local & Interprocedural Taint Data Flow Analysis (Source to Sink)
   const taintVulns = performTaintAnalysis(ast, code);
+  const interprocVulns = performInterproceduralTaintAnalysis(ast, filename);
 
   // 4. Formal Software Science Metrics
   const halstead = calculateHalsteadMetrics(tokens, code);
@@ -67,6 +69,24 @@ export function executeTrueStaticAnalysis(
         ? `const query = 'SELECT * FROM users WHERE username = ? AND tenant_id = ?';\nconst [user] = await db.query(query, [username, tenantId]);`
         : undefined,
     });
+  });
+
+  // Add Interprocedural Taint Vulnerabilities (Cross-function data flow)
+  interprocVulns.filter(ipv => !ipv.sanitized).forEach((ipv) => {
+    // Avoid duplicate if already covered by local taint on the same sink line
+    if (!findings.some(f => f.line === ipv.sink.line && f.category === 'security')) {
+      findings.push({
+        id: `ip-taint-${findingCounter++}`,
+        title: 'CWE-89: Interprocedural Taint-Tracked SQL Injection (Cross-Function Flow)',
+        severity: 'critical',
+        category: 'security',
+        line: ipv.sink.line,
+        impact: `Untrusted taint originates from \`${ipv.source.symbol}\` (L${ipv.source.line}) and propagates across function boundaries into sensitive sink \`${ipv.sink.symbol}\` (L${ipv.sink.line}).`,
+        description: `Verified interprocedural call path (${ipv.path.length} hops): ${ipv.path.map(p => `[L${p.line}: ${p.type}${p.function ? ` in ${p.function}()` : ''}]`).join(' → ')}.`,
+        recommendation: 'Enforce parameterized query bindings across all calling functions and layers.',
+        suggestedReplacement: `const query = 'SELECT * FROM users WHERE id = ?';\nawait db.query(query, [id]);`,
+      });
+    }
   });
 
   // Add AST Rule violations
@@ -117,8 +137,8 @@ export function executeTrueStaticAnalysis(
     bigOSpace = 'O(N)';
   }
 
-  const estimatedLatencyMs = criticalCount > 0 ? 450 : highCount > 0 ? 120 : 15;
-  const estimatedMemoryMb = highCount > 0 ? 120 : 16;
+  // Static Risk Level (Deterministic Static Rule Analysis, no synthetic runtime execution telemetry)
+  const staticRiskEstimate = criticalCount > 0 ? 'CRITICAL' : highCount > 0 ? 'HIGH' : mediumCount > 0 ? 'MODERATE' : 'LOW';
   const rulesPassedPercent = Math.round((ruleResults.filter(r => r.passed).length / Math.max(1, ruleResults.length)) * 100);
 
   const metrics: CodeMetrics = {
@@ -129,8 +149,7 @@ export function executeTrueStaticAnalysis(
     efficiencyScore,
     bigOTime,
     bigOSpace,
-    estimatedLatencyMs,
-    estimatedMemoryMb,
+    staticRiskEstimate,
     cyclomaticComplexity,
     rulesPassedPercent,
   };
@@ -143,6 +162,7 @@ export function executeTrueStaticAnalysis(
     tokensCount: tokens.length,
     cfg,
     taintVulnerabilities: taintVulns,
+    interproceduralVulnerabilities: interprocVulns,
     halstead,
     cognitiveComplexity,
     cyclomaticComplexity,

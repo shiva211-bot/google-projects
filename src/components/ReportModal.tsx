@@ -41,8 +41,8 @@ export const ReportModal: React.FC<ReportModalProps> = ({
 - **Maintainability Index**: ${analysis.metrics.maintainabilityScore} / 100
 - **Time Complexity**: \`${analysis.metrics.bigOTime}\`
 - **Space Complexity**: \`${analysis.metrics.bigOSpace}\`
-- **Estimated Latency**: ${analysis.metrics.estimatedLatencyMs} ms
-- **Estimated Heap Allocation**: ${analysis.metrics.estimatedMemoryMb} MB
+- **Static Risk Estimate**: ${analysis.metrics.staticRiskEstimate} (Deterministic AST Heuristic)
+- **AST Rules Compliance**: ${analysis.metrics.rulesPassedPercent}%
 
 ---
 

@@ -240,9 +240,8 @@ export function runStaticCodeAnalysis(code: string, language: string, filename: 
     bigOSpace = 'O(N)';
   }
 
-  // Latency & Memory estimates
-  const estimatedLatencyMs = criticalCount > 0 ? 450 : highCount > 0 ? 120 : 15;
-  const estimatedMemoryMb = highCount > 0 ? 120 : 16;
+  // Static Risk Level (Deterministic Static Rule Analysis, no synthetic runtime execution telemetry)
+  const staticRiskEstimate = criticalCount > 0 ? 'CRITICAL' : highCount > 0 ? 'HIGH' : mediumCount > 0 ? 'MODERATE' : 'LOW';
   const cyclomaticComplexity = Math.max(1, (code.match(/if|for|while|case|\?|&&|\|\|/g) || []).length + 1);
   const rulesPassedPercent = Math.max(0, 100 - findings.length * 15);
 
@@ -254,8 +253,7 @@ export function runStaticCodeAnalysis(code: string, language: string, filename: 
     efficiencyScore,
     bigOTime,
     bigOSpace,
-    estimatedLatencyMs,
-    estimatedMemoryMb,
+    staticRiskEstimate,
     cyclomaticComplexity,
     rulesPassedPercent
   };

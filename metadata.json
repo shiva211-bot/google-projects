@@ -1,0 +1,6 @@
+{
+  "name": "CodePulse - AI Code Sentinel & Performance Studio",
+  "description": "Real-time AI static analysis, security vulnerability scanning, interactive remediation diffs, and runtime performance optimization suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

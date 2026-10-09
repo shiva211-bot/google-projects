@@ -15,7 +15,8 @@ export interface InterproceduralTestCase {
     | 'deep_chain' 
     | 'flow_sensitive'
     | 'branch_merging'
-    | 'context_sanitization';
+    | 'context_sanitization'
+    | 'parameterized_query';
   description: string;
   code: string;
   options?: { maxIterations?: number };
@@ -25,7 +26,7 @@ export interface InterproceduralTestCase {
   expectedConvergenceStatus?: AnalysisConvergenceStatus;
   expectedMinSteps?: number;
   expectedPathSequence?: InterproceduralStepType[];
-  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean }>;
+  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean; mustExist?: boolean }>;
 }
 
 export const INTERPROCEDURAL_CORPUS: InterproceduralTestCase[] = [
@@ -46,7 +47,7 @@ db.query(query);`,
     expectedMinSteps: 3,
     expectedPathSequence: ['SOURCE', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
     },
   },
 
@@ -71,8 +72,8 @@ db.query(query);`,
     expectedMinSteps: 6,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      query: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
+      query: { isTainted: true, mustExist: true },
     },
   },
 
@@ -101,7 +102,7 @@ executeQuery(id);`,
     expectedMinSteps: 8,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
     },
   },
 
@@ -125,7 +126,7 @@ db.query(query);`,
     expectedMinSteps: 5,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
     expectedPostState: {
-      query: { isTainted: true },
+      query: { isTainted: true, mustExist: true },
     },
   },
 
@@ -152,7 +153,7 @@ executeRequest(input);`,
     expectedMinSteps: 7,
     expectedPathSequence: ['SOURCE', 'TEMPLATE', 'OBJECT_CREATION', 'ARGUMENT', 'PARAMETER', 'PROPERTY_ACCESS', 'SINK'],
     expectedPostState: {
-      input: { isTainted: true },
+      input: { isTainted: true, mustExist: true },
     },
   },
 
@@ -180,7 +181,7 @@ processRequest(payload);`,
     expectedMinSteps: 7,
     expectedPathSequence: ['SOURCE', 'TEMPLATE', 'OBJECT_CREATION', 'ARGUMENT', 'PARAMETER', 'PROPAGATION', 'SINK'],
     expectedPostState: {
-      payload: { isTainted: true },
+      payload: { isTainted: true, mustExist: true },
     },
   },
 
@@ -206,7 +207,7 @@ runSearch(q);`,
     expectedMinSteps: 6,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'PROPAGATION', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      q: { isTainted: true },
+      q: { isTainted: true, mustExist: true },
     },
   },
 
@@ -228,13 +229,13 @@ const safeId = sanitizeId(id);
 db.query(
   \`SELECT * FROM users WHERE id = \${safeId}\`
 );`,
-    expectedVulnerable: false, // Neutralized: marked sanitized/clean
+    expectedVulnerable: false,
     expectedSanitized: true,
     expectedMinSteps: 7,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'SANITIZER', 'RETURN', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      safeId: { isTainted: true, sanitized: true },
+      id: { isTainted: true, mustExist: true },
+      safeId: { isTainted: true, sanitized: true, mustExist: true },
     },
   },
 
@@ -250,14 +251,14 @@ db.query(
 const pseudoSafe = escapeHtml(id);
 const sql = \`SELECT * FROM users WHERE id = '\${pseudoSafe}'\`;
 db.query(sql);`,
-    expectedVulnerable: true, // escapeHtml does NOT neutralize SQL injection!
+    expectedVulnerable: true,
     expectedSanitized: false,
     expectedConfidence: 'confirmed',
     expectedMinSteps: 4,
     expectedPathSequence: ['SOURCE', 'SANITIZER', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      pseudoSafe: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
+      pseudoSafe: { isTainted: true, mustExist: true },
     },
   },
 
@@ -275,11 +276,11 @@ db.query(sql);`,
 
 const id = req.query.id;
 executeSafe(id);`,
-    expectedVulnerable: false, // Parameterized query is clean
+    expectedVulnerable: false,
     expectedSanitized: false,
     expectedPathSequence: [],
     expectedPostState: {
-      id: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
     },
   },
 
@@ -306,7 +307,7 @@ recursiveFetch(k, 3);`,
     expectedMinSteps: 5,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      k: { isTainted: true },
+      k: { isTainted: true, mustExist: true },
     },
   },
 
@@ -334,7 +335,7 @@ dispatchAlpha(token);`,
     expectedMinSteps: 7,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      token: { isTainted: true },
+      token: { isTainted: true, mustExist: true },
     },
   },
 
@@ -367,8 +368,8 @@ db.query(query);`,
     expectedMinSteps: 8,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'RETURN', 'RETURN', 'SINK'],
     expectedPostState: {
-      inputId: { isTainted: true },
-      query: { isTainted: true },
+      inputId: { isTainted: true, mustExist: true },
+      query: { isTainted: true, mustExist: true },
     },
   },
 
@@ -404,7 +405,7 @@ level1(secret);`,
     expectedMinSteps: 10,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'SINK'],
     expectedPostState: {
-      secret: { isTainted: true },
+      secret: { isTainted: true, mustExist: true },
     },
   },
 
@@ -419,11 +420,11 @@ level1(secret);`,
     code: `let id = req.query.id;
 id = 'safe_literal_id';
 db.query('SELECT * FROM users WHERE id = ' + id);`,
-    expectedVulnerable: false, // Taint killed by safe reassignment!
+    expectedVulnerable: false,
     expectedSanitized: false,
     expectedPathSequence: [],
     expectedPostState: {
-      id: { isTainted: false },
+      id: { isTainted: false, mustExist: true },
     },
   },
 
@@ -440,11 +441,11 @@ db.query('SELECT * FROM users WHERE id = ' + id);`,
   let id = 'safe_inner';
   db.query('SELECT * FROM users WHERE id = ' + id);
 }`,
-    expectedVulnerable: false, // Inner id shadows outer id with safe value!
+    expectedVulnerable: false,
     expectedSanitized: false,
     expectedPathSequence: [],
     expectedPostState: {
-      id: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
     },
   },
 
@@ -469,8 +470,8 @@ db.query('SELECT * FROM users WHERE id = ' + safeId);`,
     expectedMinSteps: 5,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      safeId: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
+      safeId: { isTainted: true, mustExist: true },
     },
   },
 
@@ -497,8 +498,8 @@ db.query(query);`,
     expectedMinSteps: 6,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      query: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
+      query: { isTainted: true, mustExist: true },
     },
   },
 
@@ -519,8 +520,8 @@ db.query('SELECT * FROM users WHERE id = ' + processed);`,
     expectedMinSteps: 3,
     expectedPathSequence: ['SOURCE', 'PROPAGATION', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      processed: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
+      processed: { isTainted: true, mustExist: true },
     },
   },
 
@@ -550,8 +551,8 @@ db.query(q);`,
     expectedMinSteps: 8,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'RETURN', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      q: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
+      q: { isTainted: true, mustExist: true },
     },
   },
 
@@ -570,11 +571,11 @@ if (checkFlag()) {
   id = 'safe_value_b';
 }
 db.query('SELECT * FROM users WHERE id = ' + id);`,
-    expectedVulnerable: false, // Overwritten on all paths!
+    expectedVulnerable: false,
     expectedSanitized: false,
     expectedPathSequence: [],
     expectedPostState: {
-      id: { isTainted: false },
+      id: { isTainted: false, mustExist: true },
     },
   },
 
@@ -593,12 +594,12 @@ if (checkFlag()) {
   // un-sanitized: id retains req.query.id
 }
 db.query('SELECT * FROM users WHERE id = ' + id);`,
-    expectedVulnerable: true, // One branch remains tainted -> must report vulnerability!
+    expectedVulnerable: true,
     expectedSanitized: false,
     expectedConfidence: 'confirmed',
     expectedPathSequence: ['SOURCE', 'PROPAGATION', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
     },
   },
 
@@ -615,12 +616,12 @@ if (checkFlag()) {
   id = 'safe_override';
 }
 db.query('SELECT * FROM users WHERE id = ' + id);`,
-    expectedVulnerable: true, // When condition is false, prior taint reaches sink!
+    expectedVulnerable: true,
     expectedSanitized: false,
     expectedConfidence: 'confirmed',
     expectedPathSequence: ['SOURCE', 'PROPAGATION', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
+      id: { isTainted: true, mustExist: true },
     },
   },
 
@@ -647,7 +648,7 @@ recWalk(input, 5);`,
     expectedConvergenceStatus: 'converged',
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'SINK'],
     expectedPostState: {
-      input: { isTainted: true },
+      input: { isTainted: true, mustExist: true },
     },
   },
 
@@ -678,12 +679,12 @@ mutualA(x, 2);`,
     expectedConvergenceStatus: 'converged',
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'SINK'],
     expectedPostState: {
-      x: { isTainted: true },
+      x: { isTainted: true, mustExist: true },
     },
   },
 
   // =========================================================================
-  // IP-26: Context-Sensitive Sanitization: HTML Body with escapeHtml (HIGH 3 Regression)
+  // IP-26: Context-Sensitive Sanitization: HTML Body with escapeHtml
   // =========================================================================
   {
     id: 'IP-26',
@@ -697,13 +698,13 @@ res.send('<div>Hello ' + safeName + '</div>');`,
     expectedSanitized: true,
     expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
     expectedPostState: {
-      name: { isTainted: true },
-      safeName: { isTainted: true, sanitized: true },
+      name: { isTainted: true, mustExist: true },
+      safeName: { isTainted: true, sanitized: true, mustExist: true },
     },
   },
 
   // =========================================================================
-  // IP-27: Context-Sensitive Sanitization: URL Sink with escapeHtml (HIGH 3 Regression)
+  // IP-27: Context-Sensitive Sanitization: URL Sink with escapeHtml (Vulnerable)
   // =========================================================================
   {
     id: 'IP-27',
@@ -713,17 +714,17 @@ res.send('<div>Hello ' + safeName + '</div>');`,
     code: `const dest = req.query.url;
 const pseudoSafe = escapeHtml(dest);
 location.href = pseudoSafe;`,
-    expectedVulnerable: true, // escapeHtml does NOT sanitize URL context!
+    expectedVulnerable: true,
     expectedSanitized: false,
     expectedConfidence: 'confirmed',
     expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
     expectedPostState: {
-      dest: { isTainted: true },
+      dest: { isTainted: true, mustExist: true },
     },
   },
 
   // =========================================================================
-  // IP-28: Context-Sensitive Sanitization: JavaScript Context with escapeHtml (HIGH 3 Regression)
+  // IP-28: Context-Sensitive Sanitization: JavaScript Context with escapeHtml (Vulnerable)
   // =========================================================================
   {
     id: 'IP-28',
@@ -733,37 +734,37 @@ location.href = pseudoSafe;`,
     code: `const code = req.query.code;
 const pseudoSafe = escapeHtml(code);
 eval(pseudoSafe);`,
-    expectedVulnerable: true, // escapeHtml does NOT sanitize JavaScript execution!
+    expectedVulnerable: true,
     expectedSanitized: false,
     expectedConfidence: 'confirmed',
     expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
     expectedPostState: {
-      code: { isTainted: true },
+      code: { isTainted: true, mustExist: true },
     },
   },
 
   // =========================================================================
-  // IP-29: Context-Sensitive Sanitization: URL Sink with encodeURIComponent (HIGH 3 Regression)
+  // IP-29: Context-Sensitive Sanitization: URL Component with encodeURIComponent (Safe)
   // =========================================================================
   {
     id: 'IP-29',
-    name: 'Context-Sensitive: URL Query with encodeURIComponent (Safe)',
+    name: 'Context-Sensitive: URL Query Component with encodeURIComponent (Safe)',
     category: 'context_sanitization',
-    description: 'encodeURIComponent() is valid for URL query parameter context, neutralizing parameter breakout.',
+    description: 'encodeURIComponent() is valid for URL query parameter components, neutralizing parameter breakout.',
     code: `const searchParam = req.query.q;
 const safeParam = encodeURIComponent(searchParam);
-location.href = safeParam;`,
+location.href = '/search?q=' + safeParam;`,
     expectedVulnerable: false,
     expectedSanitized: true,
     expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
     expectedPostState: {
-      searchParam: { isTainted: true },
-      safeParam: { isTainted: true, sanitized: true },
+      searchParam: { isTainted: true, mustExist: true },
+      safeParam: { isTainted: true, sanitized: true, mustExist: true },
     },
   },
 
   // =========================================================================
-  // IP-30: Context-Sensitive Sanitization: SQL Sink with Number() (HIGH 3 Regression)
+  // IP-30: Context-Sensitive Sanitization: SQL Sink with Number() (Safe)
   // =========================================================================
   {
     id: 'IP-30',
@@ -777,8 +778,8 @@ db.query('SELECT * FROM users WHERE id = ' + safeId);`,
     expectedSanitized: true,
     expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
     expectedPostState: {
-      id: { isTainted: true },
-      safeId: { isTainted: true, sanitized: true },
+      id: { isTainted: true, mustExist: true },
+      safeId: { isTainted: true, sanitized: true, mustExist: true },
     },
   },
 
@@ -797,5 +798,200 @@ loopA(x);`,
     options: { maxIterations: 1 },
     expectedVulnerable: false,
     expectedConvergenceStatus: 'resource_limit_exceeded',
+  },
+
+  // =========================================================================
+  // IP-32: Mutual Recursion with Abstract State Convergence (Critical 1 Regression)
+  // =========================================================================
+  {
+    id: 'IP-32',
+    name: 'Mutual Recursion Abstract-State Lattice Convergence',
+    category: 'recursion',
+    description: 'Verifies recursive fixed-point convergence using complete abstract-state equality across threat, properties, and taint.',
+    code: `function ping(val, count) {
+  if (count <= 0) {
+    return val;
+  }
+  return pong(val, count - 1);
+}
+
+function pong(val, count) {
+  return ping(val, count);
+}
+
+const input = req.query.data;
+const res = ping(input, 3);
+db.query('SELECT * FROM nodes WHERE token = ' + res);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedConvergenceStatus: 'converged',
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedPostState: {
+      input: { isTainted: true, mustExist: true },
+      res: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-33: Untrusted Source Reaching Command Injection Sink (High 3 Regression)
+  // =========================================================================
+  {
+    id: 'IP-33',
+    name: 'Source Untrusted Representation: Command Injection Sink',
+    category: 'direct',
+    description: 'Untrusted input is represented independently from threat and correctly associated with COMMAND_INJECTION at exec sink.',
+    code: `const cmd = req.query.command;
+child_process.exec(cmd);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'SINK'],
+    expectedPostState: {
+      cmd: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-34: Untrusted Source Reaching HTML Body Sink (High 3 Regression)
+  // =========================================================================
+  {
+    id: 'IP-34',
+    name: 'Source Untrusted Representation: HTML Body XSS Sink',
+    category: 'direct',
+    description: 'Untrusted input is represented independently from threat and correctly associated with XSS at res.send sink.',
+    code: `const msg = req.query.msg;
+res.send(msg);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'SINK'],
+    expectedPostState: {
+      msg: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-35: Variable-Backed Safe Parameterized Query (Medium 4 Regression)
+  // =========================================================================
+  {
+    id: 'IP-35',
+    name: 'Variable-Backed Safe Parameterized Query Recognized',
+    category: 'parameterized_query',
+    description: 'Recognizes parameterized queries when stored in a variable: const query = "SELECT ... WHERE id = ?"; db.query(query, [userId]).',
+    code: `const userId = req.query.id;
+const query = "SELECT * FROM users WHERE id = ?";
+db.query(query, [userId]);`,
+    expectedVulnerable: false,
+    expectedSanitized: false,
+    expectedPathSequence: [],
+    expectedPostState: {
+      userId: { isTainted: true, mustExist: true },
+      query: { isTainted: false, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-36: Template-Built Safe Parameterized Query (Medium 4 Regression)
+  // =========================================================================
+  {
+    id: 'IP-36',
+    name: 'Template-Built Safe Parameterized Query Recognized',
+    category: 'parameterized_query',
+    description: 'Recognizes parameterized queries created via static template literals without tainted expressions.',
+    code: `const userId = req.query.id;
+const query = \`SELECT * FROM users WHERE id = ?\`;
+db.query(query, [userId]);`,
+    expectedVulnerable: false,
+    expectedSanitized: false,
+    expectedPathSequence: [],
+    expectedPostState: {
+      userId: { isTainted: true, mustExist: true },
+      query: { isTainted: false, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-37: Unsafe Interpolated Query Even With Params Array (Medium 4 Regression)
+  // =========================================================================
+  {
+    id: 'IP-37',
+    name: 'Unsafe Interpolated Query With Bound Param Array (Vulnerable)',
+    category: 'parameterized_query',
+    description: 'An interpolated SQL query string containing user input remains vulnerable despite passing a second parameter array.',
+    code: `const name = req.query.name;
+const id = req.query.id;
+const query = \`SELECT * FROM users WHERE name = '\${name}' AND id = ?\`;
+db.query(query, [id]);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'TEMPLATE', 'SINK'],
+    expectedPostState: {
+      name: { isTainted: true, mustExist: true },
+      id: { isTainted: true, mustExist: true },
+      query: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-38: Complete URL Sink with encodeURIComponent (High 2 Regression - Vulnerable)
+  // =========================================================================
+  {
+    id: 'IP-38',
+    name: 'Complete URL Destination with encodeURIComponent (Vulnerable)',
+    category: 'context_sanitization',
+    description: 'encodeURIComponent() is valid for URL query components, but DOES NOT neutralize complete URL destinations against dangerous schemes.',
+    code: `const dest = req.query.redirect;
+const encodedDest = encodeURIComponent(dest);
+location.href = encodedDest;`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
+    expectedPostState: {
+      dest: { isTainted: true, mustExist: true },
+      encodedDest: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-39: HTML Attribute Context with escapeHtml (High 2 Regression - Vulnerable)
+  // =========================================================================
+  {
+    id: 'IP-39',
+    name: 'HTML Attribute Sink with escapeHtml (Vulnerable)',
+    category: 'context_sanitization',
+    description: 'escapeHtml() is valid for HTML body text, but does NOT neutralize HTML attribute context in setAttribute().',
+    code: `const attrVal = req.query.color;
+const safeVal = escapeHtml(attrVal);
+element.setAttribute('title', safeVal);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
+    expectedPostState: {
+      attrVal: { isTainted: true, mustExist: true },
+      safeVal: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-40: Independent Data-Flow Post-State Verification (Medium 5 Regression)
+  // =========================================================================
+  {
+    id: 'IP-40',
+    name: 'Independent Post-State Verification with mustExist Assertion',
+    category: 'flow_sensitive',
+    description: 'Asserts post-state variable presence and value tracking independently of vulnerability classification.',
+    code: `const outerVal = req.query.id;
+const cleanVal = 'safe_string';`,
+    expectedVulnerable: false,
+    expectedSanitized: false,
+    expectedPathSequence: [],
+    expectedPostState: {
+      outerVal: { isTainted: true, mustExist: true },
+      cleanVal: { isTainted: false, mustExist: true },
+    },
   },
 ];

@@ -305,10 +305,10 @@ export const QualityDashboard: React.FC = () => {
                               const actState = res.finalVariables[varName];
                               return (
                                 <div key={varName} className="flex items-center justify-between bg-slate-950/50 px-2 py-1 rounded">
-                                  <span>Variable <code>{varName}</code>:</span>
+                                  <span>Variable <code>{varName}</code> {expState.mustExist && <span className="text-[9px] text-sky-400 font-mono">(must exist)</span>}:</span>
                                   <span>
                                     Expected: <strong className={expState.isTainted ? 'text-amber-400' : 'text-emerald-400'}>{expState.isTainted ? 'TAINTED' : 'SAFE'}</strong>
-                                    {' '}| Actual: <strong className={actState?.isTainted ? 'text-amber-400' : 'text-emerald-400'}>{actState?.isTainted ? 'TAINTED' : 'SAFE'}</strong>
+                                    {' '}| Actual: <strong className={actState?.isTainted ? 'text-amber-400' : (actState ? 'text-emerald-400' : 'text-rose-400')}>{actState ? (actState.isTainted ? 'TAINTED' : 'SAFE') : 'NOT FOUND'}</strong>
                                   </span>
                                 </div>
                               );

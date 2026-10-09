@@ -16,7 +16,7 @@ import {
   VulnerabilityConfidence
 } from './types';
 
-// Flow-sensitive value representing taint state at a given program point
+// Flow-sensitive value representing taint and abstract data-flow state
 export interface TaintValue {
   isTainted: boolean;
   threat: TaintThreatType;
@@ -30,6 +30,81 @@ export interface TaintValue {
   history: InterproceduralPathStep[];
   isUnresolvedFlow?: boolean;
   unresolvedFunction?: string;
+  stringValue?: string; // Statically tracked string literal / constant content
+}
+
+// Abstract State Equality comparison across all relevant analysis dimensions
+export function isAbstractStateEqual(a: TaintValue | null, b: TaintValue | null): boolean {
+  if (a === b) return true;
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+
+  if (a.isTainted !== b.isTainted) return false;
+  if (a.threat !== b.threat) return false;
+  if (a.sanitized !== b.sanitized) return false;
+  if (!!a.isUnresolvedFlow !== !!b.isUnresolvedFlow) return false;
+  if (a.unresolvedFunction !== b.unresolvedFunction) return false;
+
+  // Compare object property taint sets
+  const aProps = a.properties ? Array.from(a.properties).sort() : [];
+  const bProps = b.properties ? Array.from(b.properties).sort() : [];
+  if (aProps.length !== bProps.length) return false;
+  for (let i = 0; i < aProps.length; i++) {
+    if (aProps[i] !== bProps[i]) return false;
+  }
+
+  // Compare sanitizer metadata
+  if (a.sanitizerStep?.name !== b.sanitizerStep?.name) return false;
+  if (a.sanitizerStep?.neutralizesThreat !== b.sanitizerStep?.neutralizesThreat) return false;
+
+  return true;
+}
+
+// Abstract State Join (Least Upper Bound in data-flow lattice)
+export function joinAbstractValues(
+  a: TaintValue | null,
+  b: TaintValue | null,
+  mergeStep?: InterproceduralPathStep
+): TaintValue | null {
+  if (!a && !b) return null;
+  if (!a) return b;
+  if (!b) return a;
+
+  if (!a.isTainted && !b.isTainted) return null;
+  if (a.isTainted && !b.isTainted) {
+    if (mergeStep) return { ...a, history: [...a.history, mergeStep] };
+    return a;
+  }
+  if (!a.isTainted && b.isTainted) {
+    if (mergeStep) return { ...b, history: [...b.history, mergeStep] };
+    return b;
+  }
+
+  // Both branches are tainted!
+  // Safety rule: Un-sanitized taint dominates over sanitized
+  const isSanitized = a.sanitized && b.sanitized;
+  const dominant = (!a.sanitized && b.sanitized) ? a : ((a.sanitized && !b.sanitized) ? b : a);
+
+  // Union of tainted object properties
+  let mergedProps: Set<string> | undefined = undefined;
+  if (a.properties || b.properties) {
+    mergedProps = new Set([...(a.properties || []), ...(b.properties || [])]);
+  }
+
+  const isUnres = !!a.isUnresolvedFlow || !!b.isUnresolvedFlow;
+  const unresFn = a.unresolvedFunction || b.unresolvedFunction;
+  const baseHistory = mergeStep ? [...dominant.history, mergeStep] : dominant.history;
+
+  return {
+    isTainted: true,
+    threat: dominant.threat,
+    sanitized: isSanitized,
+    sanitizerStep: isSanitized ? dominant.sanitizerStep : undefined,
+    properties: mergedProps,
+    isUnresolvedFlow: isUnres,
+    unresolvedFunction: unresFn,
+    history: baseHistory,
+  };
 }
 
 // Lexical scope representation supporting block scoping and variable shadowing
@@ -74,7 +149,6 @@ export function runFlowSensitiveInterproceduralAnalysis(
   let stepsEvaluated = 0;
 
   // Parameter-sensitive function summary cache: key -> return value
-  // key: `${fnName}::${paramSignatures}`
   interface FunctionSummaryRecord {
     returnVal: TaintValue | null;
     iterations: number;
@@ -126,14 +200,48 @@ export function runFlowSensitiveInterproceduralAnalysis(
     return null;
   }
 
-  function isParameterizedCall(firstArg: any, secondArg: any): boolean {
-    if (!secondArg) return false;
-    let queryStr = '';
-    if (firstArg?.type === 'Literal' && typeof firstArg.value === 'string') {
-      queryStr = firstArg.value;
+  // Parameterized Query Verification (Medium 4):
+  // Evaluates query expression flow-sensitively. If firstArg is tainted (e.g. interpolated string),
+  // it is an unsafe query. If firstArg is a clean string with placeholders and secondArg contains parameters,
+  // it is safe.
+  function isParameterizedCall(
+    firstArg: any,
+    secondArg: any,
+    env: Map<string, TaintValue | null>,
+    scope: LexicalScope,
+    callStack: string[]
+  ): boolean {
+    if (!firstArg || !secondArg) return false;
+
+    // Check if the query expression itself was tainted by string interpolation
+    const firstEval = evaluateExpression(firstArg, env, scope, callStack);
+    if (firstEval && firstEval.isTainted) {
+      // Unsafe query! The query itself was dynamically built with tainted values
+      return false;
     }
+
+    // Extract query string representation
+    let queryStr = '';
+    if (firstArg.type === 'Literal' && typeof firstArg.value === 'string') {
+      queryStr = firstArg.value;
+    } else if (firstArg.type === 'Identifier') {
+      const key = resolveVarKey(scope, firstArg.name);
+      const val = env.get(key);
+      if (val && val.stringValue) {
+        queryStr = val.stringValue;
+      }
+    } else if (firstArg.type === 'TemplateLiteral') {
+      if (!firstArg.expressions || firstArg.expressions.length === 0) {
+        queryStr = firstArg.quasis.map((q: any) => q.value.raw).join('');
+      }
+    }
+
     const hasPlaceholders = /\?|\$\d+|:[a-zA-Z0-9_]+|@[a-zA-Z0-9_]+/.test(queryStr);
-    const hasParams = secondArg.type === 'ArrayExpression' || secondArg.type === 'ObjectExpression' || secondArg.type === 'Identifier';
+    const hasParams = 
+      secondArg.type === 'ArrayExpression' || 
+      secondArg.type === 'ObjectExpression' || 
+      secondArg.type === 'Identifier';
+
     return hasPlaceholders && hasParams;
   }
 
@@ -141,13 +249,16 @@ export function runFlowSensitiveInterproceduralAnalysis(
     return args
       .map(a => {
         if (!a || !a.isTainted) return 'safe';
-        if (a.sanitized) return `sanitized:${a.threat}`;
-        return `tainted:${a.threat}`;
+        const propsStr = a.properties && a.properties.size > 0 
+          ? `[${Array.from(a.properties).sort().join(';')}]` 
+          : '*';
+        const unresStr = a.isUnresolvedFlow ? ':unres' : '';
+        return `${a.threat}:${a.sanitized ? 'sanitized' : 'tainted'}:${propsStr}${unresStr}`;
       })
-      .join(',');
+      .join('|');
   }
 
-  // Evaluates an expression flow-sensitively against the current environment
+  // Evaluates an expression flow-sensitively against current environment
   function evaluateExpression(
     expr: any,
     env: Map<string, TaintValue | null>,
@@ -157,8 +268,17 @@ export function runFlowSensitiveInterproceduralAnalysis(
     stepsEvaluated++;
     if (!expr) return null;
 
-    // 1. Literal -> Always safe (clean). Kills taint if assigned.
+    // 1. Literal -> Clean. Tracks stringValue if string.
     if (expr.type === 'Literal') {
+      if (typeof expr.value === 'string') {
+        return {
+          isTainted: false,
+          threat: 'UNTRUSTED',
+          sanitized: false,
+          history: [],
+          stringValue: expr.value,
+        };
+      }
       return null;
     }
 
@@ -172,7 +292,9 @@ export function runFlowSensitiveInterproceduralAnalysis(
     if (expr.type === 'MemberExpression') {
       const objStr = extractMemberString(expr);
 
-      // 3A. Direct untrusted source: req.body, req.query, req.params, request.*
+      // 3A. Untrusted Source: req.body, req.query, req.params, request.*
+      // (HIGH 3: Represents untrusted input independently from a specific threat.
+      // Threat is assigned based on sink context at invocation time.)
       if (/req\.(body|query|params|headers)|request\.|input/i.test(objStr)) {
         const line = expr.loc?.start?.line || 1;
         const step: InterproceduralPathStep = {
@@ -182,15 +304,12 @@ export function runFlowSensitiveInterproceduralAnalysis(
           function: scope.name !== 'global' ? scope.name : undefined,
           functionName: scope.name,
           symbol: objStr,
-          description: `Tainted input ingested from ${objStr}`,
+          description: `Untrusted input ingested from ${objStr}`,
         };
-
-        // Threat classification based on source context or default SQL/XSS
-        const threat: TaintThreatType = 'SQL_INJECTION';
 
         return {
           isTainted: true,
-          threat,
+          threat: 'UNTRUSTED', // Independent from specific threat
           sanitized: false,
           history: [step],
         };
@@ -203,7 +322,6 @@ export function runFlowSensitiveInterproceduralAnalysis(
         const key = resolveVarKey(scope, objName);
         const objVal = env.get(key);
         if (objVal && objVal.isTainted) {
-          // If properties are specified, check if this specific property is tainted
           if (!objVal.properties || objVal.properties.has(propName)) {
             const line = expr.loc?.start?.line || 1;
             const step: InterproceduralPathStep = {
@@ -233,39 +351,70 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
     // 4. TemplateLiteral: `SELECT * FROM users WHERE id = ${id}`
     if (expr.type === 'TemplateLiteral') {
+      let isAnyTainted = false;
+      let firstTainted: TaintValue | null = null;
+
       for (const subExpr of expr.expressions || []) {
         const subVal = evaluateExpression(subExpr, env, scope, callStack);
         if (subVal && subVal.isTainted) {
-          const line = expr.loc?.start?.line || 1;
-          const step: InterproceduralPathStep = {
-            stepNumber: subVal.history.length + 1,
-            type: 'TEMPLATE',
-            line,
-            function: scope.name !== 'global' ? scope.name : undefined,
-            functionName: scope.name,
-            description: 'Interpolated into template literal string',
-          };
-
-          return {
-            isTainted: true,
-            threat: subVal.threat,
-            sanitized: subVal.sanitized,
-            sanitizerStep: subVal.sanitizerStep,
-            isUnresolvedFlow: subVal.isUnresolvedFlow,
-            unresolvedFunction: subVal.unresolvedFunction,
-            history: [...subVal.history, step],
-          };
+          isAnyTainted = true;
+          firstTainted = subVal;
+          break;
         }
       }
-      return null;
+
+      if (isAnyTainted && firstTainted) {
+        const line = expr.loc?.start?.line || 1;
+        const step: InterproceduralPathStep = {
+          stepNumber: firstTainted.history.length + 1,
+          type: 'TEMPLATE',
+          line,
+          function: scope.name !== 'global' ? scope.name : undefined,
+          functionName: scope.name,
+          description: 'Interpolated into template literal string',
+        };
+
+        return {
+          isTainted: true,
+          threat: firstTainted.threat,
+          sanitized: firstTainted.sanitized,
+          sanitizerStep: firstTainted.sanitizerStep,
+          isUnresolvedFlow: firstTainted.isUnresolvedFlow,
+          unresolvedFunction: firstTainted.unresolvedFunction,
+          history: [...firstTainted.history, step],
+        };
+      }
+
+      // Untainted template literal: extract raw string value
+      const rawString = expr.quasis?.map((q: any) => q.value?.raw || '').join('');
+      return {
+        isTainted: false,
+        threat: 'UNTRUSTED',
+        sanitized: false,
+        history: [],
+        stringValue: rawString,
+      };
     }
 
     // 5. BinaryExpression (+): 'SELECT ...' + id
     if (expr.type === 'BinaryExpression' && expr.operator === '+') {
       const leftVal = evaluateExpression(expr.left, env, scope, callStack);
-      if (leftVal && leftVal.isTainted) return leftVal;
       const rightVal = evaluateExpression(expr.right, env, scope, callStack);
+
+      if (leftVal && leftVal.isTainted) return leftVal;
       if (rightVal && rightVal.isTainted) return rightVal;
+
+      const leftStr = leftVal?.stringValue;
+      const rightStr = rightVal?.stringValue;
+      if (typeof leftStr === 'string' && typeof rightStr === 'string') {
+        return {
+          isTainted: false,
+          threat: 'UNTRUSTED',
+          sanitized: false,
+          history: [],
+          stringValue: leftStr + rightStr,
+        };
+      }
       return null;
     }
 
@@ -273,7 +422,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     if (expr.type === 'ObjectExpression') {
       const taintedProps = new Set<string>();
       let combinedHistory: InterproceduralPathStep[] = [];
-      let threat: TaintThreatType = 'SQL_INJECTION';
+      let dominantThreat: TaintThreatType = 'UNTRUSTED';
       let isSanitized = false;
       let isUnres = false;
       let unresFn: string | undefined;
@@ -284,7 +433,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const propVal = evaluateExpression(prop.value, env, scope, callStack);
           if (propVal && propVal.isTainted) {
             taintedProps.add(propName);
-            threat = propVal.threat;
+            dominantThreat = propVal.threat;
             isSanitized = propVal.sanitized;
             isUnres = !!propVal.isUnresolvedFlow;
             unresFn = propVal.unresolvedFunction;
@@ -306,7 +455,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
         return {
           isTainted: true,
-          threat,
+          threat: dominantThreat,
           sanitized: isSanitized,
           properties: taintedProps,
           isUnresolvedFlow: isUnres,
@@ -325,7 +474,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
       const firstTaintedArg = evaluatedArgs.find((a: any) => a && a.isTainted);
 
       if (!calleeName) {
-        // Dynamic/computed call without static name -> handle conservatively as UNRESOLVED FLOW
+        // Computed call -> unresolved flow finding
         if (firstTaintedArg) {
           unresolvedCallsCount++;
           const line = expr.loc?.start?.line || 1;
@@ -335,7 +484,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             line,
             function: scope.name !== 'global' ? scope.name : undefined,
             functionName: scope.name,
-            description: 'Conservatively propagated taint through computed/dynamic call (unresolved flow)',
+            description: 'Conservatively propagated taint through computed call (unresolved flow)',
           };
           return {
             isTainted: true,
@@ -348,7 +497,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         return null;
       }
 
-      // Check if it is a verified built-in sanitizer: Number(), parseInt(), escapeHtml(), etc.
+      // Check if built-in sanitizer: Number(), parseInt(), escapeHtml(), encodeURIComponent(), etc.
       if (isBuiltinSanitizer(calleeName)) {
         if (firstTaintedArg) {
           const line = expr.loc?.start?.line || 1;
@@ -359,7 +508,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             function: scope.name !== 'global' ? scope.name : undefined,
             functionName: scope.name,
             symbol: calleeName,
-            description: `Passed through verified sanitizer '${calleeName}()'`,
+            description: `Passed through sanitizer '${calleeName}()'`,
           };
 
           return {
@@ -377,27 +526,24 @@ export function runFlowSensitiveInterproceduralAnalysis(
         return null;
       }
 
-      // Check if it is a user function resolved in the CallGraph
+      // Check if user function resolved in CallGraph
       const resolvedTarget = callGraph.resolveCallee(calleeName);
       if (resolvedTarget) {
         const paramSig = buildParamSignature(evaluatedArgs);
         const cacheKey = `${resolvedTarget.name}::${paramSig}`;
 
-        // Check if we are inside a recursive cycle
+        // Recursive cycle detection
         const isCurrentlyInCallStack = callStack.includes(resolvedTarget.name);
         if (isCurrentlyInCallStack) {
-          // Check summary cache for fixed-point result
           const cached = summaryCache.get(cacheKey);
           if (cached) {
             return cached.returnVal;
           }
-
-          // Initial recursive approximation: return null (bottom of lattice)
-          // Allows base case to be evaluated and fixed-point algorithm to iterate
+          // Bottom of lattice for initial approximation
           return null;
         }
 
-        // Interprocedural step: pass arguments into callee
+        // Interprocedural step: bind arguments to callee parameters
         const line = expr.loc?.start?.line || 1;
         const calleeScope = createScope(resolvedTarget.name, null);
         const calleeEnv = new Map<string, TaintValue | null>();
@@ -410,8 +556,8 @@ export function runFlowSensitiveInterproceduralAnalysis(
           if (argVal && argVal.isTainted) {
             const stepArg: InterproceduralPathStep = {
               stepNumber: argVal.history.length + 1,
-              type: 'ARGUMENT',
               line,
+              type: 'ARGUMENT',
               function: resolvedTarget.name,
               functionName: scope.name,
               symbol: paramName,
@@ -420,8 +566,8 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
             const stepParam: InterproceduralPathStep = {
               stepNumber: argVal.history.length + 2,
-              type: 'PARAMETER',
               line: resolvedTarget.startLine,
+              type: 'PARAMETER',
               function: resolvedTarget.name,
               functionName: resolvedTarget.name,
               symbol: paramName,
@@ -441,11 +587,11 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
             calleeEnv.set(pKey, paramTaint);
           } else {
-            calleeEnv.set(pKey, null);
+            calleeEnv.set(pKey, argVal || null);
           }
         });
 
-        // Flow-sensitively analyze the body of the callee function
+        // Flow-sensitively analyze callee body
         const calleeResult = analyzeBlockStatements(
           resolvedTarget.declarationNode.body,
           calleeEnv,
@@ -455,7 +601,6 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
         let finalRet: TaintValue | null = null;
 
-        // Check return statements
         if (calleeResult.returnValue && calleeResult.returnValue.isTainted) {
           const retStep: InterproceduralPathStep = {
             stepNumber: calleeResult.returnValue.history.length + 1,
@@ -490,8 +635,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         return finalRet;
       }
 
-      // Unresolved call: external library, module call, or unknown function
-      // (HIGH 5: Tracked as UNRESOLVED FLOW finding, preserving safety without claiming confirmed vulnerability)
+      // Unresolved call -> Conservative propagation as unresolved-flow finding
       if (firstTaintedArg) {
         unresolvedCallsCount++;
         const line = expr.loc?.start?.line || 1;
@@ -522,7 +666,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     return null;
   }
 
-  // Analyzes a statement or block of statements in strict sequential order
+  // Analyzes statements in sequential order with branch join semantics
   function analyzeBlockStatements(
     bodyNode: any,
     env: Map<string, TaintValue | null>,
@@ -531,7 +675,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
   ): { env: Map<string, TaintValue | null>; returnValue: TaintValue | null } {
     if (!bodyNode) return { env, returnValue: null };
 
-    // If arrow function with direct expression body: (x) => expr
+    // Arrow function with expression body
     if (bodyNode.type !== 'BlockStatement' && bodyNode.type !== 'Program') {
       const retVal = evaluateExpression(bodyNode, env, scope, callStack);
       return { env, returnValue: retVal };
@@ -544,20 +688,18 @@ export function runFlowSensitiveInterproceduralAnalysis(
     for (const stmt of statements) {
       if (!stmt) continue;
 
-      // 1. VariableDeclaration: const x = init, let y = init;
+      // 1. VariableDeclaration
       if (stmt.type === 'VariableDeclaration') {
         for (const decl of stmt.declarations || []) {
           const varName = decl.id?.name;
           const init = decl.init;
 
-          // Simple identifier declaration: const id = expr
           if (varName) {
             scope.declarations.add(varName);
             const varKey = `${scope.id}::${varName}`;
             const evalVal = evaluateExpression(init, currentEnv, scope, callStack);
 
             if (evalVal && evalVal.isTainted) {
-              // Add a PROPAGATION step if aliased from another identifier: const localAlias = searchTerm;
               if (init?.type === 'Identifier') {
                 const line = stmt.loc?.start?.line || 1;
                 const propStep: InterproceduralPathStep = {
@@ -577,12 +719,16 @@ export function runFlowSensitiveInterproceduralAnalysis(
                 currentEnv.set(varKey, evalVal);
               }
             } else {
-              // Flow sensitivity: Variable initialized to clean value (kills any earlier taint)
-              currentEnv.set(varKey, null);
+              // Untainted variable initialization (retains stringValue if known for query resolution)
+              if (evalVal && typeof evalVal.stringValue === 'string') {
+                currentEnv.set(varKey, evalVal);
+              } else {
+                currentEnv.set(varKey, null);
+              }
             }
           }
 
-          // Object destructuring: const { query } = data; or const { id } = req.body;
+          // Destructuring: const { query } = data;
           if (decl.id?.type === 'ObjectPattern' && init) {
             const initVal = evaluateExpression(init, currentEnv, scope, callStack);
 
@@ -622,11 +768,11 @@ export function runFlowSensitiveInterproceduralAnalysis(
         }
       }
 
-      // 2. ExpressionStatement: reassignments (x = expr) or sink invocations
+      // 2. ExpressionStatement: reassignments and sinks
       else if (stmt.type === 'ExpressionStatement') {
         const expr = stmt.expression;
 
-        // 2A. AssignmentExpression: x = expr or obj.prop = expr (FLOW-SENSITIVE REASSIGNMENT / ASSIGNMENT SINK)
+        // 2A. AssignmentExpression
         if (expr?.type === 'AssignmentExpression') {
           const leftName = expr.left?.name;
           if (leftName) {
@@ -649,16 +795,19 @@ export function runFlowSensitiveInterproceduralAnalysis(
                 history: [...evalVal.history, propStep],
               });
             } else {
-              // CRITICAL: Reassignment to safe/clean value KILLS earlier taint!
-              currentEnv.set(varKey, null);
+              // Reassignment to safe/clean value KILLS earlier taint
+              if (evalVal && typeof evalVal.stringValue === 'string') {
+                currentEnv.set(varKey, evalVal);
+              } else {
+                currentEnv.set(varKey, null);
+              }
             }
           } else if (expr.left?.type === 'MemberExpression') {
-            // Assignment to property: check sinks (e.g. location.href = ..., element.innerHTML = ...)
             checkPropertyAssignmentSink(expr, currentEnv, scope, callStack);
           }
         }
 
-        // 2B. CallExpression at statement level: check sinks and step into call flow-sensitively
+        // 2B. CallExpression at statement level
         let callExpr: any = null;
         if (expr?.type === 'CallExpression') callExpr = expr;
         else if (expr?.type === 'AwaitExpression' && expr.argument?.type === 'CallExpression') callExpr = expr.argument;
@@ -669,28 +818,33 @@ export function runFlowSensitiveInterproceduralAnalysis(
         }
       }
 
-      // 3. ReturnStatement: return expr;
+      // 3. ReturnStatement
       else if (stmt.type === 'ReturnStatement') {
         if (stmt.argument) {
           if (stmt.argument.type === 'CallExpression') {
             checkSinkInvocation(stmt.argument, currentEnv, scope, callStack);
           }
-          capturedReturn = evaluateExpression(stmt.argument, currentEnv, scope, callStack);
+          const evalRet = evaluateExpression(stmt.argument, currentEnv, scope, callStack);
+          capturedReturn = capturedReturn
+            ? joinAbstractValues(capturedReturn, evalRet)
+            : evalRet;
         }
       }
 
-      // 4. Nested BlockStatement: { ... } (variable shadowing in block scopes)
+      // 4. Nested BlockStatement (lexical shadowing)
       else if (stmt.type === 'BlockStatement') {
         const blockScope = createScope('block', scope);
         const blockRes = analyzeBlockStatements(stmt, currentEnv, blockScope, callStack);
         currentEnv = blockRes.env;
-        if (blockRes.returnValue) capturedReturn = blockRes.returnValue;
+        if (blockRes.returnValue) {
+          capturedReturn = capturedReturn
+            ? joinAbstractValues(capturedReturn, blockRes.returnValue)
+            : blockRes.returnValue;
+        }
       }
 
-      // 5. IfStatement: if (cond) { ... } else { ... }
-      // (CRITICAL 1: Branch-Sensitive State Merging via Join Lattice)
+      // 5. IfStatement: Branch-Sensitive State Merging via Join Lattice
       else if (stmt.type === 'IfStatement') {
-        // Save pre-branch environment
         const priorEnv = new Map(currentEnv);
 
         // Path 1: Consequent branch
@@ -699,78 +853,45 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const ifScope = createScope('if_block', scope);
           const ifRes = analyzeBlockStatements(stmt.consequent, new Map(priorEnv), ifScope, callStack);
           ifEnv = ifRes.env;
-          if (ifRes.returnValue) capturedReturn = ifRes.returnValue;
+          if (ifRes.returnValue) {
+            capturedReturn = capturedReturn
+              ? joinAbstractValues(capturedReturn, ifRes.returnValue)
+              : ifRes.returnValue;
+          }
         }
 
-        // Path 2: Alternate branch (or fall-through if no alternate)
+        // Path 2: Alternate branch
         let elseEnv = new Map(priorEnv);
         if (stmt.alternate) {
           const elseScope = createScope('else_block', scope);
           const elseRes = analyzeBlockStatements(stmt.alternate, new Map(priorEnv), elseScope, callStack);
           elseEnv = elseRes.env;
-          if (elseRes.returnValue) capturedReturn = elseRes.returnValue;
+          if (elseRes.returnValue) {
+            capturedReturn = capturedReturn
+              ? joinAbstractValues(capturedReturn, elseRes.returnValue)
+              : elseRes.returnValue;
+          }
         }
 
-        // Merge ifEnv and elseEnv back into currentEnv
-        // Join Lattice:
-        // - If both paths overwrite with safe value -> clean (null)
-        // - If either path preserves/introduces taint -> TAINTED (conservative safety)
-        // - If one path sanitizes and one is un-sanitized -> un-sanitized taint dominates
+        // Merge ifEnv and elseEnv back into currentEnv using join lattice
         const allKeys = new Set([...ifEnv.keys(), ...elseEnv.keys(), ...priorEnv.keys()]);
 
         for (const varKey of allKeys) {
           const valIf = ifEnv.get(varKey);
           const valElse = elseEnv.get(varKey);
 
-          const isIfTainted = !!valIf && valIf.isTainted;
-          const isElseTainted = !!valElse && valElse.isTainted;
+          const branchStep: InterproceduralPathStep = {
+            stepNumber: 1, // Will be offset in joinAbstractValues
+            type: 'PROPAGATION',
+            line: stmt.loc?.start?.line || 1,
+            function: scope.name !== 'global' ? scope.name : undefined,
+            functionName: scope.name,
+            symbol: varKey.split('::')[1] || varKey,
+            description: `Branch merge: variable '${varKey.split('::')[1]}' flow merged`,
+          };
 
-          if (!isIfTainted && !isElseTainted) {
-            // Both branches are safe -> variable is safe!
-            currentEnv.set(varKey, null);
-          } else if (isIfTainted && !isElseTainted) {
-            // If branch is tainted, else is clean: post-branch is tainted!
-            const branchStep: InterproceduralPathStep = {
-              stepNumber: valIf!.history.length + 1,
-              type: 'PROPAGATION',
-              line: stmt.loc?.start?.line || 1,
-              function: scope.name !== 'global' ? scope.name : undefined,
-              functionName: scope.name,
-              symbol: varKey.split('::')[1] || varKey,
-              description: `Branch merge: variable '${varKey.split('::')[1]}' retains taint along consequent branch`,
-            };
-            currentEnv.set(varKey, {
-              ...valIf!,
-              history: [...valIf!.history, branchStep],
-            });
-          } else if (!isIfTainted && isElseTainted) {
-            // Else branch is tainted, if is clean (e.g. no else, or else tainted): post-branch is tainted!
-            const branchStep: InterproceduralPathStep = {
-              stepNumber: valElse!.history.length + 1,
-              type: 'PROPAGATION',
-              line: stmt.loc?.end?.line || stmt.loc?.start?.line || 1,
-              function: scope.name !== 'global' ? scope.name : undefined,
-              functionName: scope.name,
-              symbol: varKey.split('::')[1] || varKey,
-              description: `Branch merge: variable '${varKey.split('::')[1]}' retains taint along alternate branch`,
-            };
-            currentEnv.set(varKey, {
-              ...valElse!,
-              history: [...valElse!.history, branchStep],
-            });
-          } else {
-            // Both branches are tainted!
-            if (valIf!.sanitized && !valElse!.sanitized) {
-              // Un-sanitized branch dominates!
-              currentEnv.set(varKey, valElse!);
-            } else if (!valIf!.sanitized && valElse!.sanitized) {
-              // Un-sanitized branch dominates!
-              currentEnv.set(varKey, valIf!);
-            } else {
-              // Both have same sanitizer status
-              currentEnv.set(varKey, valIf!);
-            }
-          }
+          const mergedVal = joinAbstractValues(valIf || null, valElse || null, branchStep);
+          currentEnv.set(varKey, mergedVal);
         }
       }
     }
@@ -778,7 +899,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     return { env: currentEnv, returnValue: capturedReturn };
   }
 
-  // Checks whether an AssignmentExpression assigns taint to a sensitive property sink (e.g. location.href = tainted, element.innerHTML = tainted)
+  // Checks assignment to property sinks (e.g. location.href, element.innerHTML)
   function checkPropertyAssignmentSink(
     assignNode: any,
     env: Map<string, TaintValue | null>,
@@ -798,7 +919,13 @@ export function runFlowSensitiveInterproceduralAnalysis(
     let sinkThreat: TaintThreatType | null = null;
 
     if (objectName === 'location' && propName === 'href') {
-      sinkContext = 'URL_CONTEXT';
+      // Determine if right-hand side is a full destination or query component
+      const right = assignNode.right;
+      if (right?.type === 'BinaryExpression' && right.operator === '+') {
+        sinkContext = 'URL_COMPONENT';
+      } else {
+        sinkContext = 'URL_DESTINATION';
+      }
       sinkThreat = 'XSS';
     } else if (propName === 'innerhtml' || propName === 'outerhtml') {
       sinkContext = 'HTML_BODY';
@@ -844,7 +971,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         if (!isDuplicate) {
           vulnerabilities.push({
             id: `ip-vuln-${vulnCount++}`,
-            vulnerabilityType: sinkThreat,
+            vulnerabilityType: sinkThreat, // Correct threat associated at sink
             confidence,
             isUnresolvedFlow: argEval.isUnresolvedFlow,
             unresolvedFunction: argEval.unresolvedFunction,
@@ -852,7 +979,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             source: {
               file: filename,
               line: sourceStep?.line || 1,
-              symbol: sourceStep?.symbol || 'req.query.id',
+              symbol: sourceStep?.symbol || 'input',
             },
             sink: {
               file: filename,
@@ -868,7 +995,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     }
   }
 
-  // Checks whether a CallExpression invokes a sensitive sink with tainted arguments
+  // Checks sensitive call sinks: query, exec, open, send, eval, etc.
   function checkSinkInvocation(
     callNode: any,
     env: Map<string, TaintValue | null>,
@@ -886,11 +1013,10 @@ export function runFlowSensitiveInterproceduralAnalysis(
       methodName = callee.name.toLowerCase();
     }
 
-    // Determine sink context and threat type
     let sinkContext: SinkContext | null = null;
     let sinkThreat: TaintThreatType | null = null;
 
-    // 1. SQL Query Sinks
+    // 1. SQL Query Sinks (query, execute, raw)
     if ((methodName === 'query' || methodName === 'execute' || methodName === 'raw') &&
         !['document', 'window', 'url', 'searchparams', 'router', 'graphql'].includes(objectName)) {
       sinkContext = 'SQL_QUERY';
@@ -906,26 +1032,53 @@ export function runFlowSensitiveInterproceduralAnalysis(
       sinkContext = 'JAVASCRIPT_CONTEXT';
       sinkThreat = 'XSS';
     }
-    // 4. URL Sinks (location.href, window.open, setAttribute('href'))
+    // 4. URL Sinks (window.open, location.href, setAttribute)
     else if (methodName === 'open' || (objectName === 'location' && methodName === 'href')) {
-      sinkContext = 'URL_CONTEXT';
+      const firstArg = callNode.arguments[0];
+      if (firstArg?.type === 'BinaryExpression' && firstArg.operator === '+') {
+        sinkContext = 'URL_COMPONENT';
+      } else {
+        sinkContext = 'URL_DESTINATION';
+      }
       sinkThreat = 'XSS';
     }
-    // 5. Command Execution Sinks (exec, spawn)
+    // 5. HTML Attribute Sink (element.setAttribute)
+    else if (methodName === 'setattribute' && callNode.arguments?.length >= 2) {
+      const attrNameArg = callNode.arguments[0];
+      const attrName = (attrNameArg?.value || '').toLowerCase();
+      if (attrName === 'href' || attrName === 'src') {
+        sinkContext = 'URL_DESTINATION';
+      } else {
+        sinkContext = 'HTML_ATTRIBUTE';
+      }
+      sinkThreat = 'XSS';
+    }
+    // 6. Command Execution Sinks (exec, spawn, execSync)
     else if (methodName === 'exec' || methodName === 'spawn' || methodName === 'execsync') {
       sinkContext = 'COMMAND_EXEC';
       sinkThreat = 'COMMAND_INJECTION';
+    }
+    // 7. Path Traversal Sinks (readFile, readFileSync, createReadStream)
+    else if (methodName === 'readfile' || methodName === 'readfilesync' || methodName === 'createreadstream') {
+      sinkContext = 'PATH_RESOLVE';
+      sinkThreat = 'PATH_TRAVERSAL';
     }
 
     if (sinkContext && sinkThreat && callNode.arguments?.length > 0) {
       const firstArg = callNode.arguments[0];
       const secondArg = callNode.arguments[1];
 
-      // Safe parameterized query check (e.g. db.query('SELECT ... WHERE id = ?', [id]))
-      const isParamSafe = sinkContext === 'SQL_QUERY' && isParameterizedCall(firstArg, secondArg);
+      // Safe Parameterized Query Verification (Medium 4)
+      const isParamSafe = sinkContext === 'SQL_QUERY' && 
+        isParameterizedCall(firstArg, secondArg, env, scope, callStack);
 
       if (!isParamSafe) {
-        const argEval = evaluateExpression(firstArg, env, scope, callStack);
+        // For setAttribute, the tainted argument to check is the second argument (value)
+        const targetArg = (methodName === 'setattribute' && callNode.arguments.length >= 2)
+          ? callNode.arguments[1]
+          : firstArg;
+
+        const argEval = evaluateExpression(targetArg, env, scope, callStack);
 
         if (argEval && argEval.isTainted) {
           const line = callNode.loc?.start?.line || 1;
@@ -944,9 +1097,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const fullPath = [...argEval.history, sinkStep];
           const sourceStep = fullPath[0];
 
-          // Context-sensitive sanitization check (CRITICAL / HIGH 3 FIX):
-          // If argument passed through a sanitizer, verify whether that sanitizer
-          // is valid for THIS SPECIFIC sink context!
+          // Context-sensitive sanitization check
           let effectiveSanitized = argEval.sanitized;
           if (argEval.sanitizerStep) {
             const isNeutralizedInThisContext = doesNeutralizeThreatInContext(
@@ -957,12 +1108,10 @@ export function runFlowSensitiveInterproceduralAnalysis(
             effectiveSanitized = isNeutralizedInThisContext;
           }
 
-          // Determine confidence: confirmed vs unresolved_flow
           const confidence: VulnerabilityConfidence = argEval.isUnresolvedFlow
             ? 'unresolved_flow'
             : 'confirmed';
 
-          // Prevent duplicate recording of the exact same vulnerability line
           const isDuplicate = vulnerabilities.some(
             v => v.sink.line === line && v.source.line === sourceStep?.line && v.sanitized === effectiveSanitized
           );
@@ -970,7 +1119,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
           if (!isDuplicate) {
             vulnerabilities.push({
               id: `ip-vuln-${vulnCount++}`,
-              vulnerabilityType: sinkThreat,
+              vulnerabilityType: sinkThreat, // Correct threat associated at sink!
               confidence,
               isUnresolvedFlow: argEval.isUnresolvedFlow,
               unresolvedFunction: argEval.unresolvedFunction,
@@ -978,7 +1127,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
               source: {
                 file: filename,
                 line: sourceStep?.line || 1,
-                symbol: sourceStep?.symbol || 'req.query.id',
+                symbol: sourceStep?.symbol || 'input',
               },
               sink: {
                 file: filename,
@@ -995,7 +1144,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     }
   }
 
-  // Worklist-Based Fixed-Point Algorithm with Convergence Proof
+  // Worklist-Based Fixed-Point Algorithm with Explicit Abstract State Convergence (Critical 1)
   const MAX_ITERATIONS = options?.maxIterations ?? 50;
   let iterations = 0;
   let converged = true;
@@ -1017,7 +1166,6 @@ export function runFlowSensitiveInterproceduralAnalysis(
       iterations++;
 
       for (const recFn of recursiveFunctions) {
-        // Evaluate for all known parameter signatures in summaryCache
         for (const [cacheKey, recRecord] of Array.from(summaryCache.entries())) {
           if (!cacheKey.startsWith(`${recFn.name}::`)) continue;
 
@@ -1025,41 +1173,31 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const fnScope = createScope(recFn.name, null);
           const fnEnv = new Map<string, TaintValue | null>();
 
-          // Setup parameters from signature
-          const sigParts = paramSig.split(',');
+          // Setup parameters from rich abstract signature
+          const sigParts = paramSig.split('|');
           recFn.paramNames.forEach((pName, pIdx) => {
             fnScope.declarations.add(pName);
             const pKey = `${fnScope.id}::${pName}`;
             const sigVal = sigParts[pIdx] || 'safe';
 
-            if (sigVal.startsWith('tainted:')) {
-              const threat = sigVal.substring('tainted:'.length) as TaintThreatType;
+            if (sigVal !== 'safe') {
+              const segments = sigVal.split(':');
+              const threat = (segments[0] || 'UNTRUSTED') as TaintThreatType;
+              const isSanitized = segments[1] === 'sanitized';
+              const isUnres = segments[3] === 'unres';
+
               fnEnv.set(pKey, {
                 isTainted: true,
                 threat,
-                sanitized: false,
+                sanitized: isSanitized,
+                isUnresolvedFlow: isUnres,
                 history: [{
                   stepNumber: 1,
                   type: 'PARAMETER',
                   line: recFn.startLine,
                   function: recFn.name,
                   symbol: pName,
-                  description: `Parameter '${pName}' initialized for fixed-point iteration`,
-                }],
-              });
-            } else if (sigVal.startsWith('sanitized:')) {
-              const threat = sigVal.substring('sanitized:'.length) as TaintThreatType;
-              fnEnv.set(pKey, {
-                isTainted: true,
-                threat,
-                sanitized: true,
-                history: [{
-                  stepNumber: 1,
-                  type: 'PARAMETER',
-                  line: recFn.startLine,
-                  function: recFn.name,
-                  symbol: pName,
-                  description: `Parameter '${pName}' initialized as sanitized for fixed-point iteration`,
+                  description: `Parameter '${pName}' initialized for fixed-point iteration [${threat}]`,
                 }],
               });
             } else {
@@ -1072,10 +1210,8 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const prevVal = recRecord.returnVal;
           const newVal = res.returnValue;
 
-          const prevSig = prevVal ? `${prevVal.isTainted}:${prevVal.sanitized}` : 'null';
-          const newSig = newVal ? `${newVal.isTainted}:${newVal.sanitized}` : 'null';
-
-          if (prevSig !== newSig) {
+          // Abstract state equality check: compares taint, threat, sanitized, properties, unresolved
+          if (!isAbstractStateEqual(prevVal, newVal)) {
             summaryCache.set(cacheKey, {
               returnVal: newVal,
               iterations: recRecord.iterations + 1,
@@ -1093,11 +1229,20 @@ export function runFlowSensitiveInterproceduralAnalysis(
     }
   }
 
+  // Final evaluation pass: If recursive functions converged, re-evaluate with stable summaryCache
+  let finalEnvResult = rootResult;
+  if (recursiveFunctions.length > 0 && converged) {
+    vulnerabilities.length = 0;
+    const finalEnv = new Map<string, TaintValue | null>();
+    globalScope.declarations.clear();
+    finalEnvResult = analyzeBlockStatements(ast, finalEnv, globalScope, []);
+  }
+
   // Extract final variable states for verification assertions
   const finalVariables: Record<string, FinalVariableState> = {};
   for (const varName of globalScope.declarations) {
     const key = resolveVarKey(globalScope, varName);
-    const val = rootResult.env.get(key);
+    const val = finalEnvResult.env.get(key);
     if (val && val.isTainted) {
       finalVariables[varName] = {
         isTainted: true,

@@ -1,12 +1,19 @@
 import { ASTNode } from '../ast/types';
 
-export type TaintThreatType = 'SQL_INJECTION' | 'COMMAND_INJECTION' | 'PATH_TRAVERSAL' | 'XSS';
+export type TaintThreatType = 
+  | 'SQL_INJECTION' 
+  | 'COMMAND_INJECTION' 
+  | 'PATH_TRAVERSAL' 
+  | 'XSS' 
+  | 'UNTRUSTED';
 
 export type SinkContext = 
   | 'SQL_QUERY'
   | 'HTML_BODY'
   | 'HTML_ATTRIBUTE'
   | 'JAVASCRIPT_CONTEXT'
+  | 'URL_DESTINATION'
+  | 'URL_COMPONENT'
   | 'URL_CONTEXT'
   | 'COMMAND_EXEC'
   | 'PATH_RESOLVE';

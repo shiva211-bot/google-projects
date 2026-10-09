@@ -3,7 +3,7 @@ import { parseSourceCode } from '../ast/parser';
 import { runFlowSensitiveInterproceduralAnalysis } from './interproceduralTaint';
 import { 
   InterproceduralTaintVulnerability, 
-  InterproceduralPathStep,
+  InterproceduralPathStep, 
   AnalysisConvergenceStatus,
   InterproceduralStepType,
   VulnerabilityConfidence,
@@ -26,10 +26,13 @@ export interface InterproceduralTestResult {
   actualPathSequence: InterproceduralStepType[];
   expectedPathSequence?: InterproceduralStepType[];
   finalVariables: Record<string, FinalVariableState>;
-  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean }>;
-  dataFlowStateVerified: boolean;
+  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean; mustExist?: boolean }>;
+  classificationVerified: boolean;
+  sanitizerVerified: boolean;
   pathSequenceVerified: boolean;
+  dataFlowStateVerified: boolean;
   failureReason?: string;
+  failureReasons?: string[];
   durationMs: number;
 }
 
@@ -63,7 +66,9 @@ export function runInterproceduralVerificationSuite(): InterproceduralReport {
 
     totalStepsEvaluated += analysisRes.flowSensitiveStepsEvaluated;
     unresolvedCallsTotal += analysisRes.unresolvedCallsCount;
-    if (!analysisRes.converged) allConverged = false;
+    if (!analysisRes.converged && testCase.expectedConvergenceStatus !== 'resource_limit_exceeded') {
+      allConverged = false;
+    }
 
     const vulns = analysisRes.vulnerabilities;
     const activeVulns = vulns.filter(v => !v.sanitized);
@@ -72,20 +77,25 @@ export function runInterproceduralVerificationSuite(): InterproceduralReport {
     const actualVulnerable = activeVulns.length > 0;
     const actualSanitized = sanitizedVulns.length > 0;
 
-    let testPassed = true;
-    let failureReason: string | undefined = undefined;
+    const failureReasons: string[] = [];
 
     // Check 1: Vulnerability classification
+    let classificationVerified = true;
     if (actualVulnerable !== testCase.expectedVulnerable) {
-      testPassed = false;
-      failureReason = `Classification mismatch: Expected vulnerable=${testCase.expectedVulnerable}, but got ${actualVulnerable} (active: ${activeVulns.length}, sanitized: ${sanitizedVulns.length})`;
+      classificationVerified = false;
+      failureReasons.push(
+        `Classification: Expected vulnerable=${testCase.expectedVulnerable}, but got ${actualVulnerable} (active: ${activeVulns.length}, sanitized: ${sanitizedVulns.length})`
+      );
     }
 
     // Check 2: Sanitizer expectation
-    if (testPassed && testCase.expectedSanitized !== undefined) {
+    let sanitizerVerified = true;
+    if (testCase.expectedSanitized !== undefined) {
       if (actualSanitized !== testCase.expectedSanitized) {
-        testPassed = false;
-        failureReason = `Sanitizer status mismatch: Expected sanitized=${testCase.expectedSanitized}, but got ${actualSanitized}`;
+        sanitizerVerified = false;
+        failureReasons.push(
+          `Sanitizer: Expected sanitized=${testCase.expectedSanitized}, but got ${actualSanitized}`
+        );
       }
     }
 
@@ -95,27 +105,30 @@ export function runInterproceduralVerificationSuite(): InterproceduralReport {
     const actualPathSequence = tracePath.map(p => p.type);
     const actualConfidence = primaryVuln?.confidence;
 
-    // Check 3: Confidence level matching (e.g. confirmed vs unresolved_flow)
-    if (testPassed && testCase.expectedConfidence && primaryVuln) {
+    // Check 3: Confidence level matching
+    if (testCase.expectedConfidence && primaryVuln) {
       if (primaryVuln.confidence !== testCase.expectedConfidence) {
-        testPassed = false;
-        failureReason = `Confidence level mismatch: Expected '${testCase.expectedConfidence}', but finding had '${primaryVuln.confidence}'`;
+        failureReasons.push(
+          `Confidence: Expected '${testCase.expectedConfidence}', but finding had '${primaryVuln.confidence}'`
+        );
       }
     }
 
     // Check 4: Convergence status
-    if (testPassed && testCase.expectedConvergenceStatus) {
+    if (testCase.expectedConvergenceStatus) {
       if (analysisRes.status !== testCase.expectedConvergenceStatus) {
-        testPassed = false;
-        failureReason = `Convergence status mismatch: Expected '${testCase.expectedConvergenceStatus}', but analysis returned '${analysisRes.status}'`;
+        failureReasons.push(
+          `Convergence: Expected status '${testCase.expectedConvergenceStatus}', but analysis returned '${analysisRes.status}'`
+        );
       }
     }
 
     // Check 5: Minimum path step count
-    if (testPassed && testCase.expectedMinSteps && primaryVuln) {
+    if (testCase.expectedMinSteps && primaryVuln) {
       if (tracePath.length < testCase.expectedMinSteps) {
-        testPassed = false;
-        failureReason = `Step count insufficient: Expected at least ${testCase.expectedMinSteps} path steps, but trace had ${tracePath.length}`;
+        failureReasons.push(
+          `Step Count: Expected at least ${testCase.expectedMinSteps} path steps, but trace had ${tracePath.length}`
+        );
       }
     }
 
@@ -124,57 +137,57 @@ export function runInterproceduralVerificationSuite(): InterproceduralReport {
     if (testCase.expectedPathSequence !== undefined) {
       const expected = testCase.expectedPathSequence;
       if (expected.length === 0) {
-        // Safe case expecting absence of trace
         if (actualPathSequence.length !== 0) {
           pathSequenceVerified = false;
-          testPassed = false;
-          failureReason = `Path trace expected to be empty for safe case, but trace had [${actualPathSequence.join(' → ')}]`;
+          failureReasons.push(
+            `Path Sequence: Expected trace to be empty for safe case, but trace had [${actualPathSequence.join(' → ')}]`
+          );
         }
       } else {
-        // Active or sanitized trace expected
         const sequenceMatches = actualPathSequence.length === expected.length &&
           actualPathSequence.every((val, idx) => val === expected[idx]);
 
         if (!sequenceMatches) {
           pathSequenceVerified = false;
-          testPassed = false;
-          failureReason = `Path sequence mismatch: Expected [${expected.join(' → ')}], but got [${actualPathSequence.join(' → ')}]`;
+          failureReasons.push(
+            `Path Sequence: Expected [${expected.join(' → ')}], but got [${actualPathSequence.join(' → ')}]`
+          );
         }
       }
     }
 
-    // Check 7: Post-Branch / Post-Execution Data-Flow State Assertion
+    // Check 7: Post-Branch / Post-Execution Data-Flow State Assertion (Independent of Classification)
     let dataFlowStateVerified = true;
-    if (testPassed && testCase.expectedPostState) {
+    if (testCase.expectedPostState) {
       for (const [varName, expectedState] of Object.entries(testCase.expectedPostState)) {
         const actualState = analysisRes.finalVariables[varName];
 
         if (!actualState) {
-          // If expecting untainted and variable is not in finalVariables, it is untainted/clean
-          if (expectedState.isTainted) {
+          if (expectedState.mustExist || expectedState.isTainted) {
             dataFlowStateVerified = false;
-            testPassed = false;
-            failureReason = `Post-state mismatch: Expected variable '${varName}' to be tainted=true, but variable was not found in environment`;
-            break;
+            failureReasons.push(
+              `State Assertion: Variable '${varName}' was expected to exist in environment (mustExist=${!!expectedState.mustExist}, isTainted=${expectedState.isTainted}), but was not found`
+            );
           }
         } else {
           if (actualState.isTainted !== expectedState.isTainted) {
             dataFlowStateVerified = false;
-            testPassed = false;
-            failureReason = `Post-state mismatch: Expected variable '${varName}' isTainted=${expectedState.isTainted}, but actual was ${actualState.isTainted}`;
-            break;
+            failureReasons.push(
+              `State Assertion: Variable '${varName}' isTainted expected ${expectedState.isTainted}, got ${actualState.isTainted}`
+            );
           }
 
           if (expectedState.sanitized !== undefined && actualState.sanitized !== expectedState.sanitized) {
             dataFlowStateVerified = false;
-            testPassed = false;
-            failureReason = `Post-state mismatch: Expected variable '${varName}' sanitized=${expectedState.sanitized}, but actual was ${actualState.sanitized}`;
-            break;
+            failureReasons.push(
+              `State Assertion: Variable '${varName}' sanitized expected ${expectedState.sanitized}, got ${actualState.sanitized}`
+            );
           }
         }
       }
     }
 
+    const testPassed = failureReasons.length === 0;
     if (testPassed) {
       passedCount++;
     }
@@ -198,9 +211,12 @@ export function runInterproceduralVerificationSuite(): InterproceduralReport {
       expectedPathSequence: testCase.expectedPathSequence,
       finalVariables: analysisRes.finalVariables,
       expectedPostState: testCase.expectedPostState,
-      dataFlowStateVerified,
+      classificationVerified,
+      sanitizerVerified,
       pathSequenceVerified,
-      failureReason,
+      dataFlowStateVerified,
+      failureReason: failureReasons.length > 0 ? failureReasons.join(' | ') : undefined,
+      failureReasons: failureReasons.length > 0 ? failureReasons : undefined,
       durationMs: testDuration,
     });
   }

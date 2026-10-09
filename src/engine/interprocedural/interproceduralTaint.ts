@@ -1,40 +1,97 @@
 import { ASTNode } from '../ast/types';
 import { CallGraph } from './callGraph';
-import { doesNeutralizeThreat, lookupSanitizer } from './sanitizerModel';
+import { doesNeutralizeThreat, isBuiltinSanitizer } from './sanitizerModel';
 import { 
   InterproceduralTaintVulnerability, 
   InterproceduralPathStep, 
-  TaintThreatType 
+  TaintThreatType,
+  InterproceduralAnalysisResult,
+  AnalysisConvergenceStatus,
+  FunctionSummary
 } from './types';
 
-interface TaintedVariable {
-  name: string;
-  scope: string; // 'global' or function name
+// Flow-sensitive value representing taint state at a given program point
+export interface TaintValue {
+  isTainted: boolean;
   threat: TaintThreatType;
   sanitized: boolean;
-  sanitizerName?: string;
-  sanitizerLine?: number;
-  properties?: Set<string>; // If object, which properties are tainted
+  sanitizerStep?: {
+    line: number;
+    name: string;
+    neutralizesThreat: boolean;
+  };
+  properties?: Set<string>; // If object, which specific properties are tainted
   history: InterproceduralPathStep[];
+}
+
+// Lexical scope representation supporting block scoping and variable shadowing
+interface LexicalScope {
+  id: string;
+  name: string; // 'global', function name, or 'block_N'
+  parent: LexicalScope | null;
+  declarations: Set<string>;
 }
 
 export function performInterproceduralTaintAnalysis(
   ast: ASTNode | null,
   filename = 'source.js'
 ): InterproceduralTaintVulnerability[] {
-  const vulnerabilities: InterproceduralTaintVulnerability[] = [];
-  if (!ast) return vulnerabilities;
+  const result = runFlowSensitiveInterproceduralAnalysis(ast, filename);
+  const vulns = result.vulnerabilities;
+  (vulns as any).analysisResult = result;
+  return vulns;
+}
 
-  const callGraph = new CallGraph(ast);
-  const taintedVars = new Map<string, TaintedVariable>();
-  let vulnCount = 1;
-
-  function makeKey(scope: string, varName: string): string {
-    return `${scope}::${varName}`;
+export function runFlowSensitiveInterproceduralAnalysis(
+  ast: ASTNode | null,
+  filename = 'source.js'
+): InterproceduralAnalysisResult {
+  if (!ast) {
+    return {
+      vulnerabilities: [],
+      iterations: 0,
+      converged: true,
+      status: 'converged',
+      unresolvedCallsCount: 0,
+      flowSensitiveStepsEvaluated: 0,
+    };
   }
 
-  function getVar(scope: string, varName: string): TaintedVariable | undefined {
-    return taintedVars.get(makeKey(scope, varName)) || taintedVars.get(makeKey('global', varName));
+  const callGraph = new CallGraph(ast);
+  const vulnerabilities: InterproceduralTaintVulnerability[] = [];
+  let vulnCount = 1;
+  let unresolvedCallsCount = 0;
+  let stepsEvaluated = 0;
+
+  // Cache for function summaries: functionName -> { params: TaintValue[], returnVal: TaintValue | null }
+  interface FunctionSummaryCache {
+    paramSignatures: string;
+    returnVal: TaintValue | null;
+  }
+  const functionCache = new Map<string, FunctionSummaryCache>();
+
+  // Worklist of function names to re-evaluate when interprocedural flow changes
+  const worklist = new Set<string>();
+  let scopeCounter = 1;
+
+  function createScope(name: string, parent: LexicalScope | null = null): LexicalScope {
+    return {
+      id: `scope_${scopeCounter++}_${name}`,
+      name,
+      parent,
+      declarations: new Set<string>(),
+    };
+  }
+
+  function resolveVarKey(scope: LexicalScope, varName: string): string {
+    let curr: LexicalScope | null = scope;
+    while (curr) {
+      if (curr.declarations.has(varName)) {
+        return `${curr.id}::${varName}`;
+      }
+      curr = curr.parent;
+    }
+    return `global::${varName}`;
   }
 
   function extractMemberString(expr: any): string {
@@ -48,624 +105,608 @@ export function performInterproceduralTaintAnalysis(
     return '';
   }
 
-  function evaluateExpressionTaint(
-    expr: any, 
-    scope: string,
-    visitedFns = new Set<string>()
-  ): { isTainted: boolean; history: InterproceduralPathStep[]; isSanitized: boolean } {
-    if (!expr) return { isTainted: false, history: [], isSanitized: false };
+  function extractCalleeName(callee: any): string | null {
+    if (!callee) return null;
+    if (callee.type === 'Identifier') return callee.name;
+    if (callee.type === 'MemberExpression') {
+      const obj = callee.object?.name || (callee.object?.type === 'ThisExpression' ? 'this' : '');
+      const prop = callee.property?.name || callee.property?.value || '';
+      return obj ? `${obj}.${prop}` : prop;
+    }
+    return null;
+  }
 
-    // Case 1: Direct identifier: id
+  function isParameterizedCall(firstArg: any, secondArg: any): boolean {
+    if (!secondArg) return false;
+    let queryStr = '';
+    if (firstArg?.type === 'Literal' && typeof firstArg.value === 'string') {
+      queryStr = firstArg.value;
+    }
+    const hasPlaceholders = /\?|\$\d+|:[a-zA-Z0-9_]+|@[a-zA-Z0-9_]+/.test(queryStr);
+    const hasParams = secondArg.type === 'ArrayExpression' || secondArg.type === 'ObjectExpression' || secondArg.type === 'Identifier';
+    return hasPlaceholders && hasParams;
+  }
+
+  // Evaluates an expression flow-sensitively against the current environment
+  function evaluateExpression(
+    expr: any,
+    env: Map<string, TaintValue | null>,
+    scope: LexicalScope,
+    callStack: string[] = []
+  ): TaintValue | null {
+    stepsEvaluated++;
+    if (!expr) return null;
+
+    // 1. Literal -> Always safe (clean). Kills taint if assigned.
+    if (expr.type === 'Literal') {
+      return null;
+    }
+
+    // 2. Identifier: lookup in flow-sensitive environment
     if (expr.type === 'Identifier') {
-      const t = getVar(scope, expr.name);
-      if (t) {
-        return { isTainted: true, history: t.history, isSanitized: t.sanitized };
-      }
+      const key = resolveVarKey(scope, expr.name);
+      return env.get(key) || null;
     }
 
-    // Case 2: TemplateLiteral: `SELECT ... ${id}`
-    if (expr.type === 'TemplateLiteral') {
-      for (const exp of expr.expressions || []) {
-        const sub = evaluateExpressionTaint(exp, scope, visitedFns);
-        if (sub.isTainted) {
-          const line = expr.loc?.start?.line || 1;
-          const step: InterproceduralPathStep = {
-            stepNumber: sub.history.length + 1,
-            type: 'TEMPLATE',
-            line,
-            function: scope !== 'global' ? scope : undefined,
-            functionName: scope,
-            description: `Interpolated into template literal string`,
-          };
-          return { isTainted: true, history: [...sub.history, step], isSanitized: sub.isSanitized };
-        }
-      }
-    }
-
-    // Case 3: BinaryExpression (+): 'SELECT ...' + id
-    if (expr.type === 'BinaryExpression' && expr.operator === '+') {
-      const left = evaluateExpressionTaint(expr.left, scope, visitedFns);
-      if (left.isTainted) return left;
-      const right = evaluateExpressionTaint(expr.right, scope, visitedFns);
-      if (right.isTainted) return right;
-    }
-
-    // Case 4: MemberExpression: direct source or data.query / input.query
+    // 3. MemberExpression: source ingestion or object property access
     if (expr.type === 'MemberExpression') {
       const objStr = extractMemberString(expr);
 
-      // Case 4A: Direct untrusted source: req.body.name / req.query.id / req.params.id
+      // 3A. Direct untrusted source: req.body, req.query, req.params, request.*
       if (/req\.(body|query|params|headers)|request\.|input/i.test(objStr)) {
         const line = expr.loc?.start?.line || 1;
         const step: InterproceduralPathStep = {
           stepNumber: 1,
           type: 'SOURCE',
           line,
-          function: scope !== 'global' ? scope : undefined,
-          functionName: scope,
+          function: scope.name !== 'global' ? scope.name : undefined,
+          functionName: scope.name,
           symbol: objStr,
           description: `Tainted input ingested from ${objStr}`,
         };
-        return { isTainted: true, history: [step], isSanitized: false };
+
+        return {
+          isTainted: true,
+          threat: 'SQL_INJECTION',
+          sanitized: false,
+          history: [step],
+        };
       }
 
-      // Case 4B: Member of tainted object: data.query
+      // 3B. Property access on object: data.query
       const objName = expr.object?.name;
       const propName = expr.property?.name || expr.property?.value;
       if (objName) {
-        const t = getVar(scope, objName);
-        if (t && (t.properties?.has(propName) || !t.properties)) {
-          const line = expr.loc?.start?.line || 1;
-          const step: InterproceduralPathStep = {
-            stepNumber: t.history.length + 1,
-            type: 'PROPERTY_ACCESS',
-            line,
-            function: scope !== 'global' ? scope : undefined,
-            functionName: scope,
-            symbol: `${objName}.${propName}`,
-            description: `Accessed object property '${objName}.${propName}'`,
-          };
-          return { isTainted: true, history: [...t.history, step], isSanitized: t.sanitized };
+        const key = resolveVarKey(scope, objName);
+        const objVal = env.get(key);
+        if (objVal && objVal.isTainted) {
+          // If properties are specified, check if this specific property is tainted
+          if (!objVal.properties || objVal.properties.has(propName)) {
+            const line = expr.loc?.start?.line || 1;
+            const step: InterproceduralPathStep = {
+              stepNumber: objVal.history.length + 1,
+              type: 'PROPERTY_ACCESS',
+              line,
+              function: scope.name !== 'global' ? scope.name : undefined,
+              functionName: scope.name,
+              symbol: `${objName}.${propName}`,
+              description: `Accessed object property '${objName}.${propName}'`,
+            };
+
+            return {
+              isTainted: true,
+              threat: objVal.threat,
+              sanitized: objVal.sanitized,
+              sanitizerStep: objVal.sanitizerStep,
+              history: [...objVal.history, step],
+            };
+          }
         }
       }
+      return null;
     }
 
-    // Case 5: CallExpression: Sanitizers or User-Defined Functions
-    if (expr.type === 'CallExpression') {
-      const calleeName = extractCalleeName(expr.callee);
-      const isUserFunction = calleeName ? callGraph.getFunction(calleeName) !== undefined : false;
-
-      // Sanitizer Call: Number(id) / parseInt(id) / escapeHtml(id)
-      const isKnownSanitizer = calleeName && !isUserFunction && (
-        lookupSanitizer(calleeName) !== undefined ||
-        calleeName.toLowerCase().includes('sanitize') ||
-        calleeName.toLowerCase().includes('escape')
-      );
-
-      if (isKnownSanitizer && expr.arguments?.length > 0) {
-        const arg0 = expr.arguments[0];
-        const argEval = evaluateExpressionTaint(arg0, scope, visitedFns);
-        if (argEval.isTainted) {
-          const neutralizesSQL = doesNeutralizeThreat(calleeName, 'SQL_INJECTION') ||
-            calleeName.toLowerCase().includes('sanitize');
+    // 4. TemplateLiteral: `SELECT * FROM users WHERE id = ${id}`
+    if (expr.type === 'TemplateLiteral') {
+      for (const subExpr of expr.expressions || []) {
+        const subVal = evaluateExpression(subExpr, env, scope, callStack);
+        if (subVal && subVal.isTainted) {
           const line = expr.loc?.start?.line || 1;
           const step: InterproceduralPathStep = {
-            stepNumber: argEval.history.length + 1,
-            type: 'SANITIZER',
+            stepNumber: subVal.history.length + 1,
+            type: 'TEMPLATE',
             line,
-            function: scope !== 'global' ? scope : undefined,
-            functionName: scope,
-            symbol: calleeName,
-            description: neutralizesSQL
-              ? `Passed through sanitizer '${calleeName}()' (Neutralizes SQL Injection: TAINT -> SANITIZER -> CLEAN)`
-              : `Passed through '${calleeName}()' (Does NOT neutralize SQL Injection: REMAYS TAINTED)`,
+            function: scope.name !== 'global' ? scope.name : undefined,
+            functionName: scope.name,
+            description: 'Interpolated into template literal string',
+          };
+
+          return {
+            isTainted: true,
+            threat: subVal.threat,
+            sanitized: subVal.sanitized,
+            sanitizerStep: subVal.sanitizerStep,
+            history: [...subVal.history, step],
+          };
+        }
+      }
+      return null;
+    }
+
+    // 5. BinaryExpression (+): 'SELECT ...' + id
+    if (expr.type === 'BinaryExpression' && expr.operator === '+') {
+      const leftVal = evaluateExpression(expr.left, env, scope, callStack);
+      if (leftVal && leftVal.isTainted) return leftVal;
+      const rightVal = evaluateExpression(expr.right, env, scope, callStack);
+      if (rightVal && rightVal.isTainted) return rightVal;
+      return null;
+    }
+
+    // 6. ObjectExpression: { query: `... ${id}` }
+    if (expr.type === 'ObjectExpression') {
+      const taintedProps = new Set<string>();
+      let combinedHistory: InterproceduralPathStep[] = [];
+      let threat: TaintThreatType = 'SQL_INJECTION';
+      let isSanitized = false;
+
+      for (const prop of expr.properties || []) {
+        const propName = prop.key?.name || prop.key?.value;
+        if (propName && prop.value) {
+          const propVal = evaluateExpression(prop.value, env, scope, callStack);
+          if (propVal && propVal.isTainted) {
+            taintedProps.add(propName);
+            threat = propVal.threat;
+            isSanitized = propVal.sanitized;
+            combinedHistory = propVal.history;
+          }
+        }
+      }
+
+      if (taintedProps.size > 0) {
+        const line = expr.loc?.start?.line || 1;
+        const step: InterproceduralPathStep = {
+          stepNumber: combinedHistory.length + 1,
+          type: 'OBJECT_CREATION',
+          line,
+          function: scope.name !== 'global' ? scope.name : undefined,
+          functionName: scope.name,
+          description: `Object instantiated with tainted properties: ${Array.from(taintedProps).join(', ')}`,
+        };
+
+        return {
+          isTainted: true,
+          threat,
+          sanitized: isSanitized,
+          properties: taintedProps,
+          history: [...combinedHistory, step],
+        };
+      }
+      return null;
+    }
+
+    // 7. CallExpression: built-in sanitizers, user functions, or unresolved calls
+    if (expr.type === 'CallExpression') {
+      const calleeName = extractCalleeName(expr.callee);
+      const args = expr.arguments || [];
+      const evaluatedArgs = args.map((a: any) => evaluateExpression(a, env, scope, callStack));
+      const firstTaintedArg = evaluatedArgs.find((a: any) => a && a.isTainted);
+
+      if (!calleeName) {
+        // Dynamic/computed call without static name -> handle conservatively if arg is tainted
+        if (firstTaintedArg) {
+          unresolvedCallsCount++;
+          const line = expr.loc?.start?.line || 1;
+          const step: InterproceduralPathStep = {
+            stepNumber: firstTaintedArg.history.length + 1,
+            type: 'PROPAGATION',
+            line,
+            function: scope.name !== 'global' ? scope.name : undefined,
+            functionName: scope.name,
+            description: 'Conservatively propagated taint through computed/dynamic call',
           };
           return {
             isTainted: true,
-            isSanitized: neutralizesSQL ? true : argEval.isSanitized,
-            history: [...argEval.history, step],
+            threat: firstTaintedArg.threat,
+            sanitized: firstTaintedArg.sanitized,
+            history: [...firstTaintedArg.history, step],
           };
         }
+        return null;
       }
 
-      // User function call returning an expression: return f(x);
-      if (isUserFunction && calleeName && !visitedFns.has(calleeName)) {
-        const nextVisited = new Set(visitedFns);
-        nextVisited.add(calleeName);
-        const targetFn = callGraph.getFunction(calleeName)!;
-        for (const retNode of targetFn.returnNodes) {
-          const retEval = evaluateExpressionTaint(retNode, calleeName, nextVisited);
-          if (retEval.isTainted) {
-            const stepRet: InterproceduralPathStep = {
-              stepNumber: retEval.history.length + 1,
-              type: 'RETURN',
-              line: retNode.loc?.start?.line || targetFn.endLine,
-              function: calleeName,
-              functionName: calleeName,
-              description: `Returned from function '${calleeName}()'`,
+      // Check if it is a verified built-in sanitizer: Number(), parseInt(), escapeHtml(), etc.
+      // (CRITICAL: Do NOT treat functions named "sanitize..." as sanitizers unless built-in or verified)
+      if (isBuiltinSanitizer(calleeName)) {
+        if (firstTaintedArg) {
+          const line = expr.loc?.start?.line || 1;
+          const neutralizes = doesNeutralizeThreat(calleeName, firstTaintedArg.threat);
+
+          const step: InterproceduralPathStep = {
+            stepNumber: firstTaintedArg.history.length + 1,
+            type: 'SANITIZER',
+            line,
+            function: scope.name !== 'global' ? scope.name : undefined,
+            functionName: scope.name,
+            symbol: calleeName,
+            description: neutralizes
+              ? `Passed through verified sanitizer '${calleeName}()' (Neutralizes ${firstTaintedArg.threat}: TAINT -> SANITIZER -> CLEAN)`
+              : `Passed through '${calleeName}()' (Does NOT neutralize ${firstTaintedArg.threat}: REMAINS TAINTED)`,
+          };
+
+          return {
+            isTainted: true,
+            threat: firstTaintedArg.threat,
+            sanitized: neutralizes ? true : firstTaintedArg.sanitized,
+            sanitizerStep: {
+              line,
+              name: calleeName,
+              neutralizesThreat: neutralizes,
+            },
+            history: [...firstTaintedArg.history, step],
+          };
+        }
+        return null;
+      }
+
+      // Check if it is a user function resolved in the CallGraph
+      const resolvedTarget = callGraph.resolveCallee(calleeName);
+      if (resolvedTarget) {
+        // Avoid infinite recursion in mutual/recursive calls
+        const recursionDepth = callStack.filter(f => f === resolvedTarget.name).length;
+        if (recursionDepth > 3) {
+          // If recursion depth exceeded, return cached or conservative result
+          return firstTaintedArg ? {
+            isTainted: true,
+            threat: firstTaintedArg.threat,
+            sanitized: firstTaintedArg.sanitized,
+            history: firstTaintedArg.history,
+          } : null;
+        }
+
+        // Interprocedural step: pass arguments into callee
+        const line = expr.loc?.start?.line || 1;
+        const calleeScope = createScope(resolvedTarget.name, null);
+        const calleeEnv = new Map<string, TaintValue | null>();
+
+        let calleeFirstTaintedArg: TaintValue | null = null;
+
+        resolvedTarget.paramNames.forEach((paramName, idx) => {
+          calleeScope.declarations.add(paramName);
+          const pKey = `${calleeScope.id}::${paramName}`;
+          const argVal = evaluatedArgs[idx];
+
+          if (argVal && argVal.isTainted) {
+            const stepArg: InterproceduralPathStep = {
+              stepNumber: argVal.history.length + 1,
+              type: 'ARGUMENT',
+              line,
+              function: resolvedTarget.name,
+              functionName: scope.name,
+              symbol: paramName,
+              description: `Passed as argument '${paramName}' into function '${resolvedTarget.name}()'`,
             };
-            return {
+
+            const stepParam: InterproceduralPathStep = {
+              stepNumber: argVal.history.length + 2,
+              type: 'PARAMETER',
+              line: resolvedTarget.startLine,
+              function: resolvedTarget.name,
+              functionName: resolvedTarget.name,
+              symbol: paramName,
+              description: `Bound to parameter '${paramName}' in '${resolvedTarget.name}()'`,
+            };
+
+            const paramTaint: TaintValue = {
               isTainted: true,
-              isSanitized: retEval.isSanitized,
-              history: [...retEval.history, stepRet],
-            };
-          }
-        }
-      }
-    }
-
-    return { isTainted: false, history: [], isSanitized: false };
-  }
-
-  function extractCalleeName(callee: any): string | null {
-    if (!callee) return null;
-    if (callee.type === 'Identifier') return callee.name;
-    if (callee.type === 'MemberExpression') {
-      const obj = callee.object?.name || '';
-      const prop = callee.property?.name || '';
-      return obj ? `${obj}.${prop}` : prop;
-    }
-    return null;
-  }
-
-  // 1. Initial Pass: Ingest Sources, Object Literals, and Local Destructuring
-  function scanScope(node: any, currentScope = 'global') {
-    if (!node || typeof node !== 'object') return;
-
-    let nextScope = currentScope;
-    if (node.type === 'FunctionDeclaration' && node.id?.name) {
-      nextScope = node.id.name;
-    } else if (
-      node.type === 'VariableDeclarator' &&
-      node.id?.name &&
-      (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
-    ) {
-      nextScope = node.id.name;
-    }
-
-    // Check variable declarator
-    if (node.type === 'VariableDeclarator') {
-      const line = node.loc?.start?.line || 1;
-      const varName = node.id?.name;
-      const init = node.init;
-
-      // Pattern A: Direct source assignment: const id = req.query.id
-      if (varName && init) {
-        if (init.type === 'MemberExpression') {
-          const objStr = extractMemberString(init);
-          if (/req\.(body|query|params|headers)|request\.|input/i.test(objStr)) {
-            const step: InterproceduralPathStep = {
-              stepNumber: 1,
-              type: 'SOURCE',
-              line,
-              function: currentScope !== 'global' ? currentScope : undefined,
-              functionName: currentScope,
-              symbol: objStr,
-              description: `Tainted input ingested from ${objStr}`,
+              threat: argVal.threat,
+              sanitized: argVal.sanitized,
+              sanitizerStep: argVal.sanitizerStep,
+              properties: argVal.properties ? new Set(argVal.properties) : undefined,
+              history: [...argVal.history, stepArg, stepParam],
             };
 
-            taintedVars.set(makeKey(currentScope, varName), {
-              name: varName,
-              scope: currentScope,
-              threat: 'SQL_INJECTION',
-              sanitized: false,
-              history: [step],
-            });
-          }
-        }
-
-        // Pattern B: Object creation: const input = { query: `... ${req.query.id}` }
-        if (init.type === 'ObjectExpression') {
-          const taintedProps = new Set<string>();
-          const initialHistory: InterproceduralPathStep[] = [];
-
-          for (const prop of init.properties || []) {
-            const propName = prop.key?.name || prop.key?.value;
-            if (propName && prop.value) {
-              // Direct source in property value: `... ${req.query.id}`
-              let propEval = evaluateExpressionTaint(prop.value, currentScope);
-              
-              // Also check if prop.value directly contains req.query.id
-              if (!propEval.isTainted && prop.value.type === 'TemplateLiteral') {
-                for (const expr of prop.value.expressions || []) {
-                  const mStr = extractMemberString(expr);
-                  if (/req\.(body|query|params|headers)|request\.|input/i.test(mStr)) {
-                    const stepSrc: InterproceduralPathStep = {
-                      stepNumber: 1,
-                      type: 'SOURCE',
-                      line: expr.loc?.start?.line || line,
-                      function: currentScope !== 'global' ? currentScope : undefined,
-                      functionName: currentScope,
-                      symbol: mStr,
-                      description: `Tainted input ingested from ${mStr}`,
-                    };
-                    const stepTpl: InterproceduralPathStep = {
-                      stepNumber: 2,
-                      type: 'TEMPLATE',
-                      line,
-                      function: currentScope !== 'global' ? currentScope : undefined,
-                      functionName: currentScope,
-                      description: `Interpolated into template literal string`,
-                    };
-                    propEval = {
-                      isTainted: true,
-                      isSanitized: false,
-                      history: [stepSrc, stepTpl],
-                    };
-                    break;
-                  }
-                }
-              }
-
-              if (propEval.isTainted) {
-                taintedProps.add(propName);
-                initialHistory.push(...propEval.history);
-                initialHistory.push({
-                  stepNumber: initialHistory.length + 1,
-                  type: 'OBJECT_CREATION',
-                  line,
-                  function: currentScope !== 'global' ? currentScope : undefined,
-                  functionName: currentScope,
-                  symbol: `${varName}.${propName}`,
-                  description: `Object '${varName}' instantiated with tainted property '${propName}'`,
-                });
-              }
-            }
-          }
-
-          if (taintedProps.size > 0) {
-            taintedVars.set(makeKey(currentScope, varName), {
-              name: varName,
-              scope: currentScope,
-              threat: 'SQL_INJECTION',
-              sanitized: false,
-              properties: taintedProps,
-              history: initialHistory,
-            });
-          }
-        }
-
-        // Pattern C: Destructuring from source: const { username } = req.body;
-        if (node.id?.type === 'ObjectPattern' && init) {
-          const initStr = extractMemberString(init);
-          if (/req\.(body|query|params|headers)|request\.|input/i.test(initStr)) {
-            for (const prop of node.id.properties || []) {
-              const propName = prop.key?.name || prop.value?.name;
-              if (propName) {
-                const step: InterproceduralPathStep = {
-                  stepNumber: 1,
-                  type: 'SOURCE',
-                  line,
-                  function: currentScope !== 'global' ? currentScope : undefined,
-                  functionName: currentScope,
-                  symbol: `${initStr}.${propName}`,
-                  description: `Tainted input ingested via destructuring from ${initStr}`,
-                };
-
-                taintedVars.set(makeKey(currentScope, propName), {
-                  name: propName,
-                  scope: currentScope,
-                  threat: 'SQL_INJECTION',
-                  sanitized: false,
-                  history: [step],
-                });
-              }
-            }
-          }
-        }
-      }
-    }
-
-    for (const key in node) {
-      if (key !== 'loc' && typeof node[key] === 'object') {
-        scanScope(node[key], nextScope);
-      }
-    }
-  }
-
-  scanScope(ast, 'global');
-
-  // 2. Fixed-Point Interprocedural Propagation (Iterations up to 10 until fixed-point)
-  let changed = true;
-  let iterations = 0;
-
-  while (changed && iterations < 10) {
-    changed = false;
-    iterations++;
-
-    // Subpass A: Local variable aliasing & destructuring in all scopes
-    function scanLocalAliases(node: any, currentScope = 'global') {
-      if (!node || typeof node !== 'object') return;
-
-      let nextScope = currentScope;
-      if (node.type === 'FunctionDeclaration' && node.id?.name) {
-        nextScope = node.id.name;
-      } else if (
-        node.type === 'VariableDeclarator' &&
-        node.id?.name &&
-        (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
-      ) {
-        nextScope = node.id.name;
-      }
-
-      if (node.type === 'VariableDeclarator') {
-        const line = node.loc?.start?.line || 1;
-        const varName = node.id?.name;
-        const init = node.init;
-
-        // Case: const localAlias = searchTerm; (Aliasing)
-        if (varName && init?.type === 'Identifier') {
-          const sourceTaint = getVar(currentScope, init.name);
-          const targetKey = makeKey(currentScope, varName);
-
-          if (sourceTaint && !taintedVars.has(targetKey)) {
-            const step: InterproceduralPathStep = {
-              stepNumber: sourceTaint.history.length + 1,
-              type: 'PROPAGATION',
-              line,
-              function: currentScope !== 'global' ? currentScope : undefined,
-              functionName: currentScope,
-              symbol: varName,
-              description: `Aliased variable '${varName}' inherits taint from '${init.name}'`,
-            };
-
-            taintedVars.set(targetKey, {
-              name: varName,
-              scope: currentScope,
-              threat: sourceTaint.threat,
-              sanitized: sourceTaint.sanitized,
-              properties: sourceTaint.properties ? new Set(sourceTaint.properties) : undefined,
-              history: [...sourceTaint.history, step],
-            });
-            changed = true;
-          }
-        }
-
-        // Case: const { query } = data; (Destructuring from object)
-        if (node.id?.type === 'ObjectPattern' && init?.type === 'Identifier') {
-          const parentTaint = getVar(currentScope, init.name);
-          if (parentTaint) {
-            for (const prop of node.id.properties || []) {
-              const propName = prop.key?.name || prop.value?.name;
-              const targetKey = makeKey(currentScope, propName);
-
-              if (propName && !taintedVars.has(targetKey)) {
-                if (!parentTaint.properties || parentTaint.properties.has(propName)) {
-                  const step: InterproceduralPathStep = {
-                    stepNumber: parentTaint.history.length + 1,
-                    type: 'PROPAGATION',
-                    line,
-                    function: currentScope !== 'global' ? currentScope : undefined,
-                    functionName: currentScope,
-                    symbol: propName,
-                    description: `Destructured property '${propName}' inherits taint from '${init.name}'`,
-                  };
-
-                  taintedVars.set(targetKey, {
-                    name: propName,
-                    scope: currentScope,
-                    threat: parentTaint.threat,
-                    sanitized: parentTaint.sanitized,
-                    history: [...parentTaint.history, step],
-                  });
-                  changed = true;
-                }
-              }
-            }
-          }
-        }
-
-        // Case: const query = `SELECT ... ${id}` or 'SELECT ...' + id;
-        if (varName && (init?.type === 'TemplateLiteral' || init?.type === 'BinaryExpression')) {
-          const evalRes = evaluateExpressionTaint(init, currentScope);
-          const targetKey = makeKey(currentScope, varName);
-
-          if (evalRes.isTainted && !taintedVars.has(targetKey)) {
-            taintedVars.set(targetKey, {
-              name: varName,
-              scope: currentScope,
-              threat: 'SQL_INJECTION',
-              sanitized: evalRes.isSanitized,
-              history: evalRes.history,
-            });
-            changed = true;
-          }
-        }
-
-        // Case: const safeId = Number(id); / escapeHtml(id); (External sanitizers only)
-        if (varName && init?.type === 'CallExpression') {
-          const calleeName = extractCalleeName(init.callee);
-          const isUserFn = calleeName ? callGraph.getFunction(calleeName) !== undefined : false;
-
-          if (!isUserFn) {
-            const evalRes = evaluateExpressionTaint(init, currentScope);
-            const targetKey = makeKey(currentScope, varName);
-
-            if (evalRes.isTainted && !taintedVars.has(targetKey)) {
-              taintedVars.set(targetKey, {
-                name: varName,
-                scope: currentScope,
-                threat: 'SQL_INJECTION',
-                sanitized: evalRes.isSanitized,
-                history: evalRes.history,
-              });
-              changed = true;
-            }
-          }
-        }
-      }
-
-      for (const key in node) {
-        if (key !== 'loc' && typeof node[key] === 'object') {
-          scanLocalAliases(node[key], nextScope);
-        }
-      }
-    }
-
-    scanLocalAliases(ast, 'global');
-
-    // Subpass B: Call Sites -> Arguments to Parameters & Return Values
-    for (const callSite of callGraph.callSites) {
-      const calleeFn = callGraph.getFunction(callSite.calleeName);
-
-      if (calleeFn) {
-        // 1. Argument -> Parameter Binding
-        callSite.argumentNodes.forEach((argNode, argIndex) => {
-          const paramName = calleeFn.paramNames[argIndex];
-          if (!paramName) return;
-
-          const argEval = evaluateExpressionTaint(argNode, callSite.callerFunctionName);
-
-          if (argEval.isTainted) {
-            const targetKey = makeKey(calleeFn.name, paramName);
-            const existing = taintedVars.get(targetKey);
-
-            if (!existing) {
-              const stepArg: InterproceduralPathStep = {
-                stepNumber: argEval.history.length + 1,
-                type: 'ARGUMENT',
-                line: callSite.line,
-                function: calleeFn.name,
-                functionName: callSite.callerFunctionName,
-                symbol: paramName,
-                description: `Passed as argument '${paramName}' into function '${calleeFn.name}()'`,
-              };
-
-              const stepParam: InterproceduralPathStep = {
-                stepNumber: argEval.history.length + 2,
-                type: 'PARAMETER',
-                line: calleeFn.startLine,
-                function: calleeFn.name,
-                functionName: calleeFn.name,
-                symbol: paramName,
-                description: `Bound to parameter '${paramName}' in '${calleeFn.name}()'`,
-              };
-
-              // Check if argument passed is an object with properties
-              let inheritedProps: Set<string> | undefined = undefined;
-              if (argNode.type === 'Identifier') {
-                const parentObj = getVar(callSite.callerFunctionName, argNode.name);
-                if (parentObj?.properties) {
-                  inheritedProps = new Set(parentObj.properties);
-                }
-              }
-
-              taintedVars.set(targetKey, {
-                name: paramName,
-                scope: calleeFn.name,
-                threat: 'SQL_INJECTION',
-                sanitized: argEval.isSanitized,
-                properties: inheritedProps,
-                history: [...argEval.history, stepArg, stepParam],
-              });
-              changed = true;
-            }
+            calleeEnv.set(pKey, paramTaint);
+            if (!calleeFirstTaintedArg) calleeFirstTaintedArg = paramTaint;
+          } else {
+            calleeEnv.set(pKey, null);
           }
         });
 
-        // 2. Callee Return Nodes -> Caller Assignee
-        for (const retNode of calleeFn.returnNodes) {
-          const retEval = evaluateExpressionTaint(retNode, calleeFn.name);
+        // Flow-sensitively analyze the body of the callee function
+        const calleeResult = analyzeBlockStatements(
+          resolvedTarget.declarationNode.body,
+          calleeEnv,
+          calleeScope,
+          [...callStack, resolvedTarget.name]
+        );
 
-          if (retEval.isTainted) {
-            const callAssignee = findAssignmentTarget(ast, callSite.callNode);
+        // Check return statements
+        if (calleeResult.returnValue && calleeResult.returnValue.isTainted) {
+          const retStep: InterproceduralPathStep = {
+            stepNumber: calleeResult.returnValue.history.length + 1,
+            type: 'RETURN',
+            line: resolvedTarget.declarationNode.loc?.end?.line || resolvedTarget.endLine,
+            function: resolvedTarget.name,
+            functionName: resolvedTarget.name,
+            description: `Returned from function '${resolvedTarget.name}()'`,
+          };
 
-            if (callAssignee) {
-              const assigneeKey = makeKey(callSite.callerFunctionName, callAssignee);
+          return {
+            isTainted: true,
+            threat: calleeResult.returnValue.threat,
+            sanitized: calleeResult.returnValue.sanitized,
+            sanitizerStep: calleeResult.returnValue.sanitizerStep,
+            properties: calleeResult.returnValue.properties,
+            history: [...calleeResult.returnValue.history, retStep],
+          };
+        }
 
-              if (!taintedVars.has(assigneeKey)) {
-                const stepReturn: InterproceduralPathStep = {
-                  stepNumber: retEval.history.length + 1,
-                  type: 'RETURN',
-                  line: retNode.loc?.start?.line || calleeFn.endLine,
-                  function: calleeFn.name,
-                  functionName: calleeFn.name,
-                  description: `Returned from function '${calleeFn.name}()'`,
-                };
+        return calleeResult.returnValue || null;
+      }
 
-                const stepAssign: InterproceduralPathStep = {
-                  stepNumber: retEval.history.length + 2,
+      // Unresolved call: external library, module call, or unknown function
+      // (HIGH 3: Handled CONSERVATIVELY — taint is preserved, not dropped)
+      if (firstTaintedArg) {
+        unresolvedCallsCount++;
+        const line = expr.loc?.start?.line || 1;
+        const step: InterproceduralPathStep = {
+          stepNumber: firstTaintedArg.history.length + 1,
+          type: 'PROPAGATION',
+          line,
+          function: scope.name !== 'global' ? scope.name : undefined,
+          functionName: scope.name,
+          symbol: calleeName,
+          description: `Conservatively propagated taint through unresolved call '${calleeName}()'`,
+        };
+
+        return {
+          isTainted: true,
+          threat: firstTaintedArg.threat,
+          sanitized: firstTaintedArg.sanitized,
+          sanitizerStep: firstTaintedArg.sanitizerStep,
+          history: [...firstTaintedArg.history, step],
+        };
+      }
+
+      return null;
+    }
+
+    return null;
+  }
+
+  // Analyzes a statement or block of statements in strict sequential order
+  function analyzeBlockStatements(
+    bodyNode: any,
+    env: Map<string, TaintValue | null>,
+    scope: LexicalScope,
+    callStack: string[]
+  ): { env: Map<string, TaintValue | null>; returnValue: TaintValue | null } {
+    if (!bodyNode) return { env, returnValue: null };
+
+    // If arrow function with direct expression body: (x) => expr
+    if (bodyNode.type !== 'BlockStatement' && bodyNode.type !== 'Program') {
+      const retVal = evaluateExpression(bodyNode, env, scope, callStack);
+      return { env, returnValue: retVal };
+    }
+
+    const statements = bodyNode.body || [];
+    let currentEnv = new Map(env);
+    let capturedReturn: TaintValue | null = null;
+
+    for (const stmt of statements) {
+      if (!stmt) continue;
+
+      // 1. VariableDeclaration: const x = init, let y = init;
+      if (stmt.type === 'VariableDeclaration') {
+        for (const decl of stmt.declarations || []) {
+          const varName = decl.id?.name;
+          const init = decl.init;
+
+          // Simple identifier declaration: const id = expr
+          if (varName) {
+            scope.declarations.add(varName);
+            const varKey = `${scope.id}::${varName}`;
+            const evalVal = evaluateExpression(init, currentEnv, scope, callStack);
+
+            if (evalVal && evalVal.isTainted) {
+              // Add a PROPAGATION step if aliased from another identifier: const localAlias = searchTerm;
+              if (init?.type === 'Identifier') {
+                const line = stmt.loc?.start?.line || 1;
+                const propStep: InterproceduralPathStep = {
+                  stepNumber: evalVal.history.length + 1,
                   type: 'PROPAGATION',
-                  line: callSite.line,
-                  function: callSite.callerFunctionName !== 'global' ? callSite.callerFunctionName : undefined,
-                  functionName: callSite.callerFunctionName,
-                  symbol: callAssignee,
-                  description: `Assigned return value to variable '${callAssignee}'`,
+                  line,
+                  function: scope.name !== 'global' ? scope.name : undefined,
+                  functionName: scope.name,
+                  symbol: varName,
+                  description: `Aliased variable '${varName}' inherits taint from '${init.name}'`,
                 };
-
-                taintedVars.set(assigneeKey, {
-                  name: callAssignee,
-                  scope: callSite.callerFunctionName,
-                  threat: 'SQL_INJECTION',
-                  sanitized: retEval.isSanitized,
-                  history: [...retEval.history, stepReturn, stepAssign],
+                currentEnv.set(varKey, {
+                  ...evalVal,
+                  history: [...evalVal.history, propStep],
                 });
-                changed = true;
+              } else {
+                currentEnv.set(varKey, evalVal);
+              }
+            } else {
+              // Flow sensitivity: Variable initialized to clean value (kills any earlier taint)
+              currentEnv.set(varKey, null);
+            }
+          }
+
+          // Object destructuring: const { query } = data; or const { id } = req.body;
+          if (decl.id?.type === 'ObjectPattern' && init) {
+            const initVal = evaluateExpression(init, currentEnv, scope, callStack);
+
+            for (const prop of decl.id.properties || []) {
+              const propName = prop.key?.name || prop.value?.name;
+              if (propName) {
+                scope.declarations.add(propName);
+                const propKey = `${scope.id}::${propName}`;
+
+                if (initVal && initVal.isTainted) {
+                  const line = stmt.loc?.start?.line || 1;
+                  const step: InterproceduralPathStep = {
+                    stepNumber: initVal.history.length + 1,
+                    type: 'PROPAGATION',
+                    line,
+                    function: scope.name !== 'global' ? scope.name : undefined,
+                    functionName: scope.name,
+                    symbol: propName,
+                    description: `Destructured property '${propName}' inherits taint`,
+                  };
+
+                  currentEnv.set(propKey, {
+                    isTainted: true,
+                    threat: initVal.threat,
+                    sanitized: initVal.sanitized,
+                    sanitizerStep: initVal.sanitizerStep,
+                    history: [...initVal.history, step],
+                  });
+                } else {
+                  currentEnv.set(propKey, null);
+                }
               }
             }
           }
         }
       }
-    }
-  }
 
-  // 3. SINK DETECTION: Scan for sensitive SQL sinks reading tainted symbols
-  function scanSinks(node: any, currentScope = 'global') {
-    if (!node || typeof node !== 'object') return;
+      // 2. ExpressionStatement: reassignments (x = expr) or sink invocations (db.query(sql))
+      else if (stmt.type === 'ExpressionStatement') {
+        const expr = stmt.expression;
 
-    let nextScope = currentScope;
-    if (node.type === 'FunctionDeclaration' && node.id?.name) {
-      nextScope = node.id.name;
-    } else if (
-      node.type === 'VariableDeclarator' &&
-      node.id?.name &&
-      (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
-    ) {
-      nextScope = node.id.name;
-    }
+        // 2A. AssignmentExpression: x = expr (FLOW-SENSITIVE REASSIGNMENT)
+        if (expr?.type === 'AssignmentExpression') {
+          const leftName = expr.left?.name;
+          if (leftName) {
+            const varKey = resolveVarKey(scope, leftName);
+            const evalVal = evaluateExpression(expr.right, currentEnv, scope, callStack);
 
-    if (node.type === 'CallExpression') {
-      const callee = node.callee;
-      let methodName = '';
-      let objectName = '';
+            if (evalVal && evalVal.isTainted) {
+              const line = stmt.loc?.start?.line || 1;
+              const propStep: InterproceduralPathStep = {
+                stepNumber: evalVal.history.length + 1,
+                type: 'PROPAGATION',
+                line,
+                function: scope.name !== 'global' ? scope.name : undefined,
+                functionName: scope.name,
+                symbol: leftName,
+                description: `Reassigned variable '${leftName}' receives taint`,
+              };
+              currentEnv.set(varKey, {
+                ...evalVal,
+                history: [...evalVal.history, propStep],
+              });
+            } else {
+              // CRITICAL 1 FIX: Reassignment to safe/clean value KILLS earlier taint!
+              currentEnv.set(varKey, null);
+            }
+          }
+        }
 
-      if (callee.type === 'MemberExpression') {
-        methodName = (callee.property?.name || '').toLowerCase();
-        objectName = (callee.object?.name || '').toLowerCase();
-      } else if (callee.type === 'Identifier') {
-        methodName = callee.name.toLowerCase();
+        // 2B. CallExpression at statement level: check sinks and step into call flow-sensitively
+        let callExpr: any = null;
+        if (expr?.type === 'CallExpression') callExpr = expr;
+        else if (expr?.type === 'AwaitExpression' && expr.argument?.type === 'CallExpression') callExpr = expr.argument;
+
+        if (callExpr) {
+          checkSinkInvocation(callExpr, currentEnv, scope, callStack);
+          evaluateExpression(callExpr, currentEnv, scope, callStack);
+        }
       }
 
-      const isQuerySink = (methodName === 'query' || methodName === 'execute' || methodName === 'raw') &&
-        !['document', 'window', 'url', 'searchparams', 'router', 'graphql'].includes(objectName);
+      // 3. ReturnStatement: return expr;
+      else if (stmt.type === 'ReturnStatement') {
+        if (stmt.argument) {
+          // If return contains a call to sink (e.g. return db.query(sql))
+          if (stmt.argument.type === 'CallExpression') {
+            checkSinkInvocation(stmt.argument, currentEnv, scope, callStack);
+          }
+          capturedReturn = evaluateExpression(stmt.argument, currentEnv, scope, callStack);
+        }
+      }
 
-      if (isQuerySink && node.arguments?.length > 0) {
-        const firstArg = node.arguments[0];
-        const secondArg = node.arguments[1];
+      // 4. Nested BlockStatement: { ... } (variable shadowing in block scopes)
+      else if (stmt.type === 'BlockStatement') {
+        const blockScope = createScope('block', scope);
+        const blockRes = analyzeBlockStatements(stmt, currentEnv, blockScope, callStack);
+        currentEnv = blockRes.env;
+        if (blockRes.returnValue) capturedReturn = blockRes.returnValue;
+      }
 
-        // Check if safely parameterized
-        const isParamSafe = isParameterizedCall(firstArg, secondArg);
+      // 5. IfStatement: if (cond) { ... }
+      else if (stmt.type === 'IfStatement') {
+        if (stmt.consequent) {
+          const ifScope = createScope('if_block', scope);
+          const ifRes = analyzeBlockStatements(stmt.consequent, currentEnv, ifScope, callStack);
+          if (ifRes.returnValue) capturedReturn = ifRes.returnValue;
+        }
+        if (stmt.alternate) {
+          const elseScope = createScope('else_block', scope);
+          const elseRes = analyzeBlockStatements(stmt.alternate, currentEnv, elseScope, callStack);
+          if (elseRes.returnValue) capturedReturn = elseRes.returnValue;
+        }
+      }
+    }
 
-        if (!isParamSafe) {
-          const evalResult = evaluateExpressionTaint(firstArg, currentScope);
+    return { env: currentEnv, returnValue: capturedReturn };
+  }
 
-          if (evalResult.isTainted) {
-            const line = node.loc?.start?.line || 1;
-            const sinkSymbol = objectName ? `${objectName}.${methodName}` : `${methodName}`;
+  // Checks whether a CallExpression invokes a sensitive sink with tainted arguments
+  function checkSinkInvocation(
+    callNode: any,
+    env: Map<string, TaintValue | null>,
+    scope: LexicalScope,
+    callStack: string[]
+  ) {
+    const callee = callNode.callee;
+    let methodName = '';
+    let objectName = '';
 
-            const sinkStep: InterproceduralPathStep = {
-              stepNumber: evalResult.history.length + 1,
-              type: 'SINK',
-              line,
-              function: currentScope !== 'global' ? currentScope : undefined,
-              functionName: currentScope,
-              symbol: sinkSymbol,
-              description: `Query executed in sensitive sink '${sinkSymbol}()'`,
-            };
+    if (callee.type === 'MemberExpression') {
+      methodName = (callee.property?.name || '').toLowerCase();
+      objectName = (callee.object?.name || '').toLowerCase();
+    } else if (callee.type === 'Identifier') {
+      methodName = callee.name.toLowerCase();
+    }
 
-            const fullPath = [...evalResult.history, sinkStep];
-            const sourceStep = fullPath[0];
+    const isQuerySink = (methodName === 'query' || methodName === 'execute' || methodName === 'raw') &&
+      !['document', 'window', 'url', 'searchparams', 'router', 'graphql'].includes(objectName);
 
+    if (isQuerySink && callNode.arguments?.length > 0) {
+      const firstArg = callNode.arguments[0];
+      const secondArg = callNode.arguments[1];
+
+      // Safe parameterized query check (e.g. db.query('SELECT ... WHERE id = ?', [id]))
+      const isParamSafe = isParameterizedCall(firstArg, secondArg);
+
+      if (!isParamSafe) {
+        const argEval = evaluateExpression(firstArg, env, scope, callStack);
+
+        if (argEval && argEval.isTainted) {
+          const line = callNode.loc?.start?.line || 1;
+          const sinkSymbol = objectName ? `${objectName}.${methodName}` : `${methodName}`;
+
+          const sinkStep: InterproceduralPathStep = {
+            stepNumber: argEval.history.length + 1,
+            type: 'SINK',
+            line,
+            function: scope.name !== 'global' ? scope.name : undefined,
+            functionName: scope.name,
+            symbol: sinkSymbol,
+            description: `Query executed in sensitive sink '${sinkSymbol}()'`,
+          };
+
+          const fullPath = [...argEval.history, sinkStep];
+          const sourceStep = fullPath[0];
+
+          // Prevent duplicate recording of the exact same vulnerability line
+          const isDuplicate = vulnerabilities.some(
+            v => v.sink.line === line && v.source.line === sourceStep?.line && v.sanitized === argEval.sanitized
+          );
+
+          if (!isDuplicate) {
             vulnerabilities.push({
               id: `ip-sqli-${vulnCount++}`,
               vulnerabilityType: 'SQL_INJECTION',
@@ -679,58 +720,68 @@ export function performInterproceduralTaintAnalysis(
                 line,
                 symbol: sinkSymbol,
               },
-              sanitized: evalResult.isSanitized,
+              sanitized: argEval.sanitized,
+              sanitizerStep: argEval.sanitizerStep,
               path: fullPath,
             });
           }
         }
       }
     }
+  }
 
-    for (const key in node) {
-      if (key !== 'loc' && typeof node[key] === 'object') {
-        scanSinks(node[key], nextScope);
+  // Convergence-based Fixed-Point Algorithm (HIGH 5 FIX)
+  const MAX_ITERATIONS = 150;
+  let iterations = 0;
+  let converged = true;
+  let analysisStatus: AnalysisConvergenceStatus = 'converged';
+
+  const globalScope = createScope('global', null);
+  const initialEnv = new Map<string, TaintValue | null>();
+
+  // Run the primary flow-sensitive analysis across the AST
+  analyzeBlockStatements(ast, initialEnv, globalScope, []);
+  iterations = 1;
+
+  // If there are recursive / mutually calling functions in the CallGraph, iterate until fixed-point convergence
+  const recursiveFunctions = Array.from(callGraph.functions.values()).filter(fn => fn.isRecursive);
+  if (recursiveFunctions.length > 0) {
+    let stateChanged = true;
+    while (stateChanged && iterations < MAX_ITERATIONS) {
+      stateChanged = false;
+      iterations++;
+
+      for (const recFn of recursiveFunctions) {
+        const prevSummary = functionCache.get(recFn.name);
+        const fnScope = createScope(recFn.name, null);
+        const fnEnv = new Map<string, TaintValue | null>();
+
+        // Re-evaluate recursive function
+        const res = analyzeBlockStatements(recFn.declarationNode.body, fnEnv, fnScope, [recFn.name]);
+        const newSig = res.returnValue ? `${res.returnValue.isTainted}:${res.returnValue.sanitized}` : 'null';
+
+        if (!prevSummary || prevSummary.paramSignatures !== newSig) {
+          functionCache.set(recFn.name, {
+            paramSignatures: newSig,
+            returnVal: res.returnValue,
+          });
+          stateChanged = true;
+        }
       }
     }
-  }
 
-  scanSinks(ast, 'global');
-
-  return vulnerabilities;
-}
-
-function findAssignmentTarget(rootAst: any, targetCallNode: any): string | null {
-  let assignee: string | null = null;
-
-  function traverse(node: any) {
-    if (!node || typeof node !== 'object' || assignee) return;
-
-    if (node.type === 'VariableDeclarator' && node.init === targetCallNode) {
-      assignee = node.id?.name || null;
-      return;
-    }
-
-    if (node.type === 'AssignmentExpression' && node.right === targetCallNode) {
-      assignee = node.left?.name || null;
-      return;
-    }
-
-    for (const key in node) {
-      if (key !== 'loc' && typeof node[key] === 'object') traverse(node[key]);
+    if (iterations >= MAX_ITERATIONS && stateChanged) {
+      converged = false;
+      analysisStatus = 'resource_limit_exceeded';
     }
   }
 
-  traverse(rootAst);
-  return assignee;
-}
-
-function isParameterizedCall(firstArg: any, secondArg: any): boolean {
-  if (!secondArg) return false;
-  let queryStr = '';
-  if (firstArg?.type === 'Literal' && typeof firstArg.value === 'string') {
-    queryStr = firstArg.value;
-  }
-  const hasPlaceholders = /\?|\$\d+|:[a-zA-Z0-9_]+|@[a-zA-Z0-9_]+/.test(queryStr);
-  const hasParams = secondArg.type === 'ArrayExpression' || secondArg.type === 'ObjectExpression' || secondArg.type === 'Identifier';
-  return hasPlaceholders && hasParams;
+  return {
+    vulnerabilities,
+    iterations,
+    converged,
+    status: analysisStatus,
+    unresolvedCallsCount,
+    flowSensitiveStepsEvaluated: stepsEvaluated,
+  };
 }

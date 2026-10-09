@@ -212,14 +212,14 @@ export const QualityDashboard: React.FC = () => {
           <div className="p-3.5 rounded-lg bg-emerald-950/20 border border-emerald-800/40 text-xs text-slate-300 space-y-1">
             <div className="flex items-center justify-between">
               <span className="font-semibold text-emerald-400 font-mono">
-                Concept 4 — Interprocedural Data-Flow Analysis Engine
+                Concept 4 — Flow-Sensitive Interprocedural Data-Flow Engine
               </span>
               <span className="font-mono text-emerald-300 text-[11px]">
-                {interprocReport.passedCases} / {interprocReport.totalCases} Verified (100%)
+                {interprocReport.passedCases} / {interprocReport.totalCases} Verified ({interprocReport.detectionScorePercent}%) · Status: {interprocReport.status.toUpperCase()}
               </span>
             </div>
             <p className="text-slate-400 text-[11px]">
-              Tracks tainted data across call sites, function parameters, return-value propagation, object properties, and destructuring. Enforces threat-specific sanitizer rules (TAINT → SANITIZER → CLEAN).
+              Tracks flow-sensitive taint across call sites, function parameters, return propagation, object methods, destructuring, and verified threat-specific sanitizers. Uses a fixed-point convergence worklist algorithm with rigorous sequence matching.
             </p>
           </div>
 
@@ -279,6 +279,27 @@ export const QualityDashboard: React.FC = () => {
                   {isExpanded && (
                     <div className="p-3.5 border-t border-slate-800/70 space-y-3 bg-slate-950/60 text-xs">
                       <p className="text-slate-300">{res.description}</p>
+
+                      {res.failureReason && (
+                        <div className="p-2.5 rounded bg-rose-950/40 border border-rose-800/60 text-rose-300 font-mono text-[11px]">
+                          <strong>Failure Reason: </strong>{res.failureReason}
+                        </div>
+                      )}
+
+                      {res.expectedPathSequence && (
+                        <div className="p-2 rounded bg-slate-900 border border-slate-800 text-[10px] font-mono space-y-1">
+                          <div className="text-slate-400">
+                            <span className="text-slate-500">Expected Sequence: </span>
+                            <span className="text-slate-200">{res.expectedPathSequence.join(' → ')}</span>
+                          </div>
+                          <div className="text-slate-400">
+                            <span className="text-slate-500">Actual Sequence: </span>
+                            <span className={res.passed ? 'text-emerald-400' : 'text-rose-400 font-bold'}>
+                              {res.actualPathSequence.join(' → ')}
+                            </span>
+                          </div>
+                        </div>
+                      )}
 
                       {/* Complete Step-by-Step Path Trace */}
                       {res.tracePath.length > 0 && (

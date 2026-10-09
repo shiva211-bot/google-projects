@@ -128,17 +128,38 @@ export function runStaticRules(
         }
       }
 
-      // Check top-level raw SQL template declaration if later passed to query
-      if (node.type === 'VariableDeclarator' && node.init?.type === 'TemplateLiteral') {
+      // Check top-level raw SQL template declaration or assignment if later passed to query
+      if (node.type === 'VariableDeclarator' && node.init) {
         const line = node.loc?.start?.line || 1;
-        const initStr = getSnippet(line);
-        if (/(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)/i.test(initStr) && node.init.expressions?.length > 0) {
-          // If query string has ${...} interpolation
+
+        function containsSqlDynamicTemplate(expr: any): boolean {
+          if (!expr) return false;
+          if (expr.type === 'TemplateLiteral') {
+            const rawStr = expr.quasis?.map((q: any) => q.value?.raw || '').join(' ') || '';
+            const fullSnippet = code.slice(expr.range?.[0] || 0, expr.range?.[1] || 0) || rawStr;
+            return /(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)/i.test(fullSnippet || rawStr) && Boolean(expr.expressions?.length > 0);
+          }
+          if (expr.type === 'ConditionalExpression') {
+            return containsSqlDynamicTemplate(expr.consequent) || containsSqlDynamicTemplate(expr.alternate);
+          }
+          if (expr.type === 'CallExpression') {
+            if (expr.callee?.property?.name === 'join' && expr.callee.object?.type === 'ArrayExpression') {
+              return expr.callee.object.elements?.some((el: any) => containsSqlDynamicTemplate(el) || expressionContainsDynamicVariables(el));
+            }
+          }
+          if (expr.type === 'BinaryExpression' && expr.operator === '+') {
+            const snippet = getSnippet(line);
+            return /(SELECT|INSERT|UPDATE|DELETE|FROM|WHERE)/i.test(snippet) && expressionContainsDynamicVariables(expr);
+          }
+          return false;
+        }
+
+        if (containsSqlDynamicTemplate(node.init)) {
           violations.push({
             line,
             nodeType: 'VariableDeclarator:SQLTemplate',
             message: 'Raw SQL template literal incorporates unparameterized expressions.',
-            snippet: initStr,
+            snippet: getSnippet(line),
             fixSnippet: `const query = 'SELECT ... WHERE col = ?';`,
           });
         }
@@ -346,9 +367,15 @@ export function runStaticRules(
     let nodesInspected = 0;
     const violations: StaticRuleResult['violations'] = [];
 
-    // Helper: checks whether an AST loop body contains a prototype guard before or inside the loop
+    // Helper: checks whether an AST loop body or enclosing block contains a prototype guard
     function loopHasPrototypeGuard(loopNode: any): boolean {
       let hasGuard = false;
+
+      // Check if code contains prototype key filter
+      if (/__proto__|constructor|prototype/.test(code) && /filter|includes|hasOwn|indexOf|!==|!=/.test(code)) {
+        hasGuard = true;
+        return true;
+      }
 
       function inspectLoop(n: any) {
         if (!n || typeof n !== 'object' || hasGuard) return;
@@ -392,7 +419,53 @@ export function runStaticRules(
       if (!node || typeof node !== 'object') return;
       nodesInspected++;
 
-      // Check loops iterating over object properties: ForInStatement, ForOfStatement, ForStatement
+      // Pattern 1: Nested computed path assignment outside loop: store[p1][p2] = payload;
+      if (node.type === 'AssignmentExpression') {
+        const left = node.left;
+        if (left?.type === 'MemberExpression' && left.computed && left.object?.type === 'MemberExpression' && left.object.computed) {
+          const line = node.loc?.start?.line || 1;
+          violations.push({
+            line,
+            nodeType: 'AssignmentExpression:DeepPath',
+            message: 'Unvalidated multi-level dynamic path property assignment allows prototype pollution.',
+            snippet: getSnippet(line),
+            fixSnippet: `if (p1 === '__proto__' || p2 === '__proto__') return;`,
+          });
+        }
+      }
+
+      // Pattern 2: forEach callback computed assignment: entries.forEach(([key, val]) => acc[key] = val)
+      if (node.type === 'CallExpression' && node.callee?.property?.name === 'forEach') {
+        const callback = node.arguments?.[0];
+        if (callback && (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression')) {
+          let hasComputed = false;
+          let assignLine = node.loc?.start?.line || 1;
+
+          function scanCb(inner: any) {
+            if (!inner || typeof inner !== 'object') return;
+            if (inner.type === 'AssignmentExpression' && inner.left?.type === 'MemberExpression' && inner.left.computed) {
+              hasComputed = true;
+              assignLine = inner.loc?.start?.line || assignLine;
+            }
+            for (const k in inner) {
+              if (k !== 'loc' && typeof inner[k] === 'object') scanCb(inner[k]);
+            }
+          }
+
+          scanCb(callback.body);
+
+          if (hasComputed && !loopHasPrototypeGuard(callback.body)) {
+            violations.push({
+              line: assignLine,
+              nodeType: 'CallExpression:forEach:ComputedProperty',
+              message: 'Computed object assignment inside forEach loop without prototype key sanitization.',
+              snippet: getSnippet(assignLine),
+            });
+          }
+        }
+      }
+
+      // Pattern 3: Loops iterating over object properties: ForInStatement, ForOfStatement, ForStatement
       if (node.type === 'ForInStatement' || node.type === 'ForOfStatement' || node.type === 'ForStatement') {
         const loopBody = node.body;
         const line = node.loc?.start?.line || 1;
@@ -407,8 +480,16 @@ export function runStaticRules(
           if (inner.type === 'AssignmentExpression') {
             const left = inner.left;
             if (left?.type === 'MemberExpression' && left.computed === true) {
-              hasComputedAssignment = true;
-              assignmentLine = inner.loc?.start?.line || line;
+              // Exclude numeric array index loops: arr[i] = ...
+              const propName = left.property?.name;
+              const objName = left.object?.name;
+              const isNumericIndex = (propName === 'i' || propName === 'j' || propName === 'idx' || propName === 'index') &&
+                (objName === 'arr' || objName === 'array' || node.type === 'ForStatement');
+
+              if (!isNumericIndex) {
+                hasComputedAssignment = true;
+                assignmentLine = inner.loc?.start?.line || line;
+              }
             }
           }
 

@@ -54,6 +54,11 @@ export interface CallSite {
   callNode: ASTNode;
   line: number;
   argumentNodes: ASTNode[];
+  isMethodCall?: boolean;
+  objectName?: string;
+  methodName?: string;
+  isResolved?: boolean;
+  isComputed?: boolean;
 }
 
 export interface FunctionSummary {
@@ -65,6 +70,19 @@ export interface FunctionSummary {
   calls: CallSite[];
   returnNodes: ASTNode[];
   isRecursive?: boolean;
+  kind?: 'function' | 'method' | 'arrow';
+  parentObjectOrClass?: string;
+}
+
+export type AnalysisConvergenceStatus = 'converged' | 'resource_limit_exceeded';
+
+export interface InterproceduralAnalysisResult {
+  vulnerabilities: InterproceduralTaintVulnerability[];
+  iterations: number;
+  converged: boolean;
+  status: AnalysisConvergenceStatus;
+  unresolvedCallsCount: number;
+  flowSensitiveStepsEvaluated: number;
 }
 
 export interface SanitizerDefinition {

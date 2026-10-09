@@ -1,7 +1,7 @@
 export interface InterproceduralTestCase {
   id: string;
   name: string;
-  category: 'direct' | 'function_boundary' | 'return_flow' | 'object_property' | 'destructuring' | 'aliasing' | 'sanitizer' | 'recursion' | 'deep_chain';
+  category: 'direct' | 'function_boundary' | 'return_flow' | 'object_property' | 'destructuring' | 'aliasing' | 'sanitizer' | 'recursion' | 'deep_chain' | 'flow_sensitive';
   description: string;
   code: string;
   expectedVulnerable: boolean;
@@ -45,7 +45,7 @@ const query = buildQuery(id);
 db.query(query);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 5,
+    expectedMinSteps: 6,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'SINK'],
   },
 
@@ -70,8 +70,8 @@ const id = req.params.id;
 executeQuery(id);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 6,
-    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'SINK'],
+    expectedMinSteps: 8,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'SINK'],
   },
 
   // =========================================================================
@@ -90,7 +90,7 @@ const query = getSql(req.body.name);
 db.query(query);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 4,
+    expectedMinSteps: 5,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
   },
 
@@ -113,7 +113,7 @@ const input = {
 executeRequest(input);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 5,
+    expectedMinSteps: 7,
     expectedPathSequence: ['SOURCE', 'TEMPLATE', 'OBJECT_CREATION', 'ARGUMENT', 'PARAMETER', 'PROPERTY_ACCESS', 'SINK'],
   },
 
@@ -137,7 +137,7 @@ const payload = {
 processRequest(payload);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 5,
+    expectedMinSteps: 7,
     expectedPathSequence: ['SOURCE', 'TEMPLATE', 'OBJECT_CREATION', 'ARGUMENT', 'PARAMETER', 'PROPAGATION', 'SINK'],
   },
 
@@ -159,7 +159,7 @@ const q = req.query.q;
 runSearch(q);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 5,
+    expectedMinSteps: 6,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'PROPAGATION', 'TEMPLATE', 'SINK'],
   },
 
@@ -181,10 +181,10 @@ const safeId = sanitizeId(id);
 db.query(
   \`SELECT * FROM users WHERE id = \${safeId}\`
 );`,
-    expectedVulnerable: false, // Marked sanitized = CLEAN
+    expectedVulnerable: false, // Neutralized: marked sanitized/clean
     expectedSanitized: true,
-    expectedMinSteps: 3,
-    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'SANITIZER'],
+    expectedMinSteps: 7,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'SANITIZER', 'RETURN', 'TEMPLATE', 'SINK'],
   },
 
   // =========================================================================
@@ -242,8 +242,8 @@ const k = req.query.key;
 recursiveFetch(k, 3);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 4,
-    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'SINK'],
+    expectedMinSteps: 5,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'SINK'],
   },
 
   // =========================================================================
@@ -266,8 +266,8 @@ const token = req.query.token;
 dispatchAlpha(token);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 5,
-    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'SINK'],
+    expectedMinSteps: 7,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'SINK'],
   },
 
   // =========================================================================
@@ -295,8 +295,8 @@ const query = step1(inputId);
 db.query(query);`,
     expectedVulnerable: true,
     expectedSanitized: false,
-    expectedMinSteps: 6,
-    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedMinSteps: 8,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'RETURN', 'RETURN', 'SINK'],
   },
 
   // =========================================================================
@@ -327,7 +327,125 @@ const secret = req.query.secret;
 level1(secret);`,
     expectedVulnerable: true,
     expectedSanitized: false,
+    expectedMinSteps: 10,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'SINK'],
+  },
+
+  // =========================================================================
+  // IP-15: Flow-Sensitive Reassignment (CRITICAL 1)
+  // =========================================================================
+  {
+    id: 'IP-15',
+    name: 'Flow-Sensitive Reassignment Kills Taint',
+    category: 'flow_sensitive',
+    description: 'Variable is initially tainted from req.query.id, but subsequent safe reassignment overwrites and kills taint.',
+    code: `let id = req.query.id;
+id = 'safe_literal_id';
+db.query('SELECT * FROM users WHERE id = ' + id);`,
+    expectedVulnerable: false, // Taint killed by safe reassignment!
+    expectedSanitized: false,
+  },
+
+  // =========================================================================
+  // IP-16: Flow-Sensitive Variable Shadowing (CRITICAL 1)
+  // =========================================================================
+  {
+    id: 'IP-16',
+    name: 'Flow-Sensitive Block Scope Variable Shadowing',
+    category: 'flow_sensitive',
+    description: 'Inner block declares id = "safe_inner", shadowing outer tainted id without mutating outer scope.',
+    code: `let id = req.query.id;
+{
+  let id = 'safe_inner';
+  db.query('SELECT * FROM users WHERE id = ' + id);
+}`,
+    expectedVulnerable: false, // Inner id shadows outer id with safe value!
+    expectedSanitized: false,
+  },
+
+  // =========================================================================
+  // IP-17: Fake Sanitizer Function (CRITICAL 2)
+  // =========================================================================
+  {
+    id: 'IP-17',
+    name: 'Function Named "sanitizeId" With No-Op Body Does NOT Sanitize',
+    category: 'sanitizer',
+    description: 'Sanitization must depend on verified behavior, not function name containing sanitize. No-op returns taint.',
+    code: `function sanitizeId(id) {
+  return id;
+}
+
+const id = req.query.id;
+const safeId = sanitizeId(id);
+db.query('SELECT * FROM users WHERE id = ' + safeId);`,
+    expectedVulnerable: true, // Dummy sanitizeId does NOT neutralize SQL injection!
+    expectedSanitized: false,
+    expectedMinSteps: 5,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+  },
+
+  // =========================================================================
+  // IP-18: Object Method Resolution (HIGH 3)
+  // =========================================================================
+  {
+    id: 'IP-18',
+    name: 'Object Method Resolution In Call Graph',
+    category: 'function_boundary',
+    description: 'Resolves object method queryService.build(id) across boundary and tracks return to sink.',
+    code: `const queryService = {
+  build(userId) {
+    return \`SELECT * FROM users WHERE id = \${userId}\`;
+  }
+};
+
+const id = req.query.id;
+const query = queryService.build(id);
+db.query(query);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedMinSteps: 6,
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'SINK'],
+  },
+
+  // =========================================================================
+  // IP-19: Conservative Handling of Unresolved Call (HIGH 3)
+  // =========================================================================
+  {
+    id: 'IP-19',
+    name: 'Conservative Taint Propagation On Unresolved Calls',
+    category: 'function_boundary',
+    description: 'Calls to unresolved external functions preserve taint conservatively rather than dropping it.',
+    code: `const id = req.query.id;
+const processed = externalBlackboxTransform(id);
+db.query('SELECT * FROM users WHERE id = ' + processed);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedMinSteps: 3,
+    expectedPathSequence: ['SOURCE', 'PROPAGATION', 'SINK'],
+  },
+
+  // =========================================================================
+  // IP-20: Deep Convergence Fixed-Point (HIGH 5)
+  // =========================================================================
+  {
+    id: 'IP-20',
+    name: 'Convergence-Based Fixed-Point Deep Call Chain',
+    category: 'deep_chain',
+    description: 'Validates convergence of interprocedural analysis without reliance on arbitrary iteration cap.',
+    code: `function chainA(x) {
+  return chainB(x);
+}
+
+function chainB(y) {
+  return \`SELECT * FROM deep WHERE val = \${y}\`;
+}
+
+const id = req.query.id;
+const q = chainA(id);
+db.query(q);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
     expectedMinSteps: 8,
-    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'SINK'],
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'ARGUMENT', 'PARAMETER', 'TEMPLATE', 'RETURN', 'RETURN', 'SINK'],
   },
 ];

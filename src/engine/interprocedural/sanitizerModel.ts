@@ -4,12 +4,12 @@ export const KNOWN_SANITIZERS: SanitizerDefinition[] = [
   {
     name: 'Number',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    description: 'Casts input to numeric literal, neutralizing SQL string and command injection.',
+    description: 'Casts input to numeric primitive, neutralizing SQL string and command injection.',
   },
   {
     name: 'parseInt',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    description: 'Parses integer value, stripping SQL quotes and operators.',
+    description: 'Parses integer value, stripping SQL quotes, operators, and path separators.',
   },
   {
     name: 'parseFloat',
@@ -17,9 +17,19 @@ export const KNOWN_SANITIZERS: SanitizerDefinition[] = [
     description: 'Parses floating point number, stripping injection payloads.',
   },
   {
-    name: 'sanitizeId',
-    neutralizesThreats: ['SQL_INJECTION'],
-    description: 'Numeric sanitizer function.',
+    name: 'Math.floor',
+    neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
+    description: 'Numeric mathematical floor conversion, stripping injection strings.',
+  },
+  {
+    name: 'Math.round',
+    neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
+    description: 'Numeric mathematical round conversion, stripping injection strings.',
+  },
+  {
+    name: 'Math.ceil',
+    neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
+    description: 'Numeric mathematical ceiling conversion, stripping injection strings.',
   },
   {
     name: 'escapeHtml',
@@ -39,7 +49,12 @@ export const KNOWN_SANITIZERS: SanitizerDefinition[] = [
 ];
 
 export function lookupSanitizer(name: string): SanitizerDefinition | undefined {
-  return KNOWN_SANITIZERS.find(s => s.name.toLowerCase() === name.toLowerCase());
+  const normalized = name.trim().toLowerCase();
+  return KNOWN_SANITIZERS.find(s => s.name.toLowerCase() === normalized);
+}
+
+export function isBuiltinSanitizer(name: string): boolean {
+  return lookupSanitizer(name) !== undefined;
 }
 
 export function doesNeutralizeThreat(sanitizerName: string, threat: TaintThreatType): boolean {

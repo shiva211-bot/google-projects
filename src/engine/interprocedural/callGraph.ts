@@ -4,6 +4,7 @@ import { FunctionSummary, CallSite } from './types';
 export class CallGraph {
   public functions = new Map<string, FunctionSummary>();
   public callSites: CallSite[] = [];
+  public aliases = new Map<string, string>(); // e.g. f -> buildQuery
 
   constructor(ast: ASTNode | null) {
     if (ast) {
@@ -15,99 +16,151 @@ export class CallGraph {
   private buildSymbolTable(ast: ASTNode) {
     let callCounter = 1;
 
-    // First pass: Index all function declarations and function expressions
-    const indexFunctions = (node: any, currentFunctionName = 'global') => {
+    // Helper to register a function summary
+    const registerFunction = (
+      name: string,
+      fnNode: any,
+      kind: 'function' | 'method' | 'arrow' = 'function',
+      parentName?: string
+    ) => {
+      const params: string[] = [];
+      for (const p of fnNode.params || []) {
+        if (p.type === 'Identifier') {
+          params.push(p.name);
+        } else if (p.type === 'ObjectPattern') {
+          for (const prop of p.properties || []) {
+            const k = prop.key?.name || prop.value?.name;
+            if (k) params.push(k);
+          }
+        }
+      }
+
+      const returnNodes: ASTNode[] = [];
+      const internalCalls: CallSite[] = [];
+
+      // Scan function body for return statements and call expressions
+      const scanBody = (inner: any) => {
+        if (!inner || typeof inner !== 'object') return;
+
+        // Don't descend into nested function declarations (they will be indexed separately)
+        if (inner !== fnNode && (
+          inner.type === 'FunctionDeclaration' || 
+          inner.type === 'ArrowFunctionExpression' || 
+          inner.type === 'FunctionExpression'
+        )) {
+          return;
+        }
+
+        if (inner.type === 'ReturnStatement' && inner.argument) {
+          returnNodes.push(inner.argument);
+        }
+
+        if (inner.type === 'CallExpression') {
+          const { calleeName, isMethodCall, objectName, methodName, isComputed } = this.inspectCallee(inner.callee);
+          if (calleeName) {
+            const cs: CallSite = {
+              id: `call-${callCounter++}`,
+              callerFunctionName: name,
+              calleeName,
+              callNode: inner,
+              line: inner.loc?.start?.line || 1,
+              argumentNodes: inner.arguments || [],
+              isMethodCall,
+              objectName,
+              methodName,
+              isComputed,
+              isResolved: false, // determined after indexing
+            };
+            internalCalls.push(cs);
+            this.callSites.push(cs);
+          }
+        }
+
+        for (const key in inner) {
+          if (key !== 'loc' && typeof inner[key] === 'object') scanBody(inner[key]);
+        }
+      };
+
+      // Arrow function with expression body: const f = (x) => expr
+      if (fnNode.body?.type !== 'BlockStatement') {
+        returnNodes.push(fnNode.body);
+      } else {
+        scanBody(fnNode.body);
+      }
+
+      const summary: FunctionSummary = {
+        name,
+        declarationNode: fnNode,
+        startLine: fnNode.loc?.start?.line || 1,
+        endLine: fnNode.loc?.end?.line || 1,
+        paramNames: params,
+        calls: internalCalls,
+        returnNodes,
+        kind,
+        parentObjectOrClass: parentName,
+      };
+
+      this.functions.set(name, summary);
+    };
+
+    // First pass: Index function declarations, variable functions, object methods, class methods, and aliases
+    const indexAst = (node: any, currentScope = 'global') => {
       if (!node || typeof node !== 'object') return;
 
-      let fnName: string | null = null;
-      let fnNode: any = null;
-
+      // 1. FunctionDeclaration: function foo() {}
       if (node.type === 'FunctionDeclaration' && node.id?.name) {
-        fnName = node.id.name;
-        fnNode = node;
-      } else if (
-        node.type === 'VariableDeclarator' &&
-        node.id?.name &&
-        (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
-      ) {
-        fnName = node.id.name;
-        fnNode = node.init;
+        registerFunction(node.id.name, node, 'function');
       }
 
-      if (fnName && fnNode) {
-        const params: string[] = [];
-        for (const p of fnNode.params || []) {
-          if (p.type === 'Identifier') {
-            params.push(p.name);
-          } else if (p.type === 'ObjectPattern') {
-            for (const prop of p.properties || []) {
-              const k = prop.key?.name || prop.value?.name;
-              if (k) params.push(k);
+      // 2. VariableDeclarator
+      if (node.type === 'VariableDeclarator' && node.id?.name && node.init) {
+        const varName = node.id.name;
+
+        // 2A: Variable function: const foo = () => {} or const foo = function() {}
+        if (node.init.type === 'ArrowFunctionExpression' || node.init.type === 'FunctionExpression') {
+          registerFunction(varName, node.init, node.init.type === 'ArrowFunctionExpression' ? 'arrow' : 'function');
+        }
+        // 2B: Aliased function: const f = buildQuery;
+        else if (node.init.type === 'Identifier') {
+          this.aliases.set(varName, node.init.name);
+        }
+        // 2C: Object literal with methods: const obj = { build(id) { ... }, format: (x) => ... }
+        else if (node.init.type === 'ObjectExpression') {
+          for (const prop of node.init.properties || []) {
+            const propName = prop.key?.name || prop.key?.value;
+            if (propName && prop.value) {
+              if (
+                prop.value.type === 'FunctionExpression' ||
+                prop.value.type === 'ArrowFunctionExpression' ||
+                prop.method === true
+              ) {
+                const qualifiedMethodName = `${varName}.${propName}`;
+                registerFunction(qualifiedMethodName, prop.value, 'method', varName);
+                // Also index by method name as fallback if not ambiguous
+                if (!this.functions.has(propName)) {
+                  this.aliases.set(propName, qualifiedMethodName);
+                }
+              }
             }
           }
         }
-
-        const returnNodes: ASTNode[] = [];
-        const internalCalls: CallSite[] = [];
-
-        // Scan function body for return statements and call expressions
-        const scanBody = (inner: any) => {
-          if (!inner || typeof inner !== 'object') return;
-
-          // Don't descend into nested function declarations (they will be indexed separately)
-          if (inner !== fnNode && (inner.type === 'FunctionDeclaration' || inner.type === 'ArrowFunctionExpression')) {
-            return;
-          }
-
-          if (inner.type === 'ReturnStatement' && inner.argument) {
-            returnNodes.push(inner.argument);
-          }
-
-          if (inner.type === 'CallExpression') {
-            const calleeName = this.extractCalleeName(inner.callee);
-            if (calleeName) {
-              const cs: CallSite = {
-                id: `call-${callCounter++}`,
-                callerFunctionName: fnName!,
-                calleeName,
-                callNode: inner,
-                line: inner.loc?.start?.line || 1,
-                argumentNodes: inner.arguments || [],
-              };
-              internalCalls.push(cs);
-              this.callSites.push(cs);
-            }
-          }
-
-          for (const key in inner) {
-            if (key !== 'loc' && typeof inner[key] === 'object') scanBody(inner[key]);
-          }
-        };
-
-        // If arrow function with direct expression body: const f = (x) => expr
-        if (fnNode.body?.type !== 'BlockStatement') {
-          returnNodes.push(fnNode.body);
-        } else {
-          scanBody(fnNode.body);
-        }
-
-        this.functions.set(fnName, {
-          name: fnName,
-          declarationNode: fnNode,
-          startLine: fnNode.loc?.start?.line || 1,
-          endLine: fnNode.loc?.end?.line || 1,
-          paramNames: params,
-          calls: internalCalls,
-          returnNodes,
-        });
-
-        // Continue indexing inside this function
-        currentFunctionName = fnName;
       }
 
-      // Record top-level (global) calls
-      if (node.type === 'CallExpression' && currentFunctionName === 'global') {
-        const calleeName = this.extractCalleeName(node.callee);
+      // 3. ClassDeclaration: class Builder { build(id) { ... } }
+      if (node.type === 'ClassDeclaration' && node.id?.name) {
+        const className = node.id.name;
+        for (const item of node.body?.body || []) {
+          if (item.type === 'MethodDefinition' && item.key?.name && item.value) {
+            const methodName = item.key.name;
+            const qualifiedName = `${className}.${methodName}`;
+            registerFunction(qualifiedName, item.value, 'method', className);
+          }
+        }
+      }
+
+      // 4. Global top-level calls
+      if (node.type === 'CallExpression' && currentScope === 'global') {
+        const { calleeName, isMethodCall, objectName, methodName, isComputed } = this.inspectCallee(node.callee);
         if (calleeName) {
           this.callSites.push({
             id: `call-${callCounter++}`,
@@ -116,39 +169,118 @@ export class CallGraph {
             callNode: node,
             line: node.loc?.start?.line || 1,
             argumentNodes: node.arguments || [],
+            isMethodCall,
+            objectName,
+            methodName,
+            isComputed,
+            isResolved: false,
           });
         }
       }
 
+      // Determine next scope for nested traversal
+      let nextScope = currentScope;
+      if (node.type === 'FunctionDeclaration' && node.id?.name) {
+        nextScope = node.id.name;
+      } else if (
+        node.type === 'VariableDeclarator' &&
+        node.id?.name &&
+        (node.init?.type === 'ArrowFunctionExpression' || node.init?.type === 'FunctionExpression')
+      ) {
+        nextScope = node.id.name;
+      }
+
       for (const key in node) {
         if (key !== 'loc' && typeof node[key] === 'object') {
-          indexFunctions(node[key], currentFunctionName);
+          indexAst(node[key], nextScope);
         }
       }
     };
 
-    indexFunctions(ast);
+    indexAst(ast);
+
+    // Resolve call sites
+    for (const cs of this.callSites) {
+      const resolved = this.resolveCallee(cs.calleeName);
+      if (resolved) {
+        cs.isResolved = true;
+      } else {
+        cs.isResolved = false;
+      }
+    }
   }
 
-  private extractCalleeName(callee: any): string | null {
-    if (!callee) return null;
-    if (callee.type === 'Identifier') return callee.name;
-    if (callee.type === 'MemberExpression') {
-      const objName = callee.object?.name || '';
-      const propName = callee.property?.name || '';
-      return objName ? `${objName}.${propName}` : propName;
+  private inspectCallee(callee: any): {
+    calleeName: string | null;
+    isMethodCall: boolean;
+    objectName?: string;
+    methodName?: string;
+    isComputed: boolean;
+  } {
+    if (!callee) {
+      return { calleeName: null, isMethodCall: false, isComputed: false };
     }
-    return null;
+
+    if (callee.type === 'Identifier') {
+      return { calleeName: callee.name, isMethodCall: false, isComputed: false };
+    }
+
+    if (callee.type === 'MemberExpression') {
+      const isComputed = !!callee.computed;
+      const objName = callee.object?.name || (callee.object?.type === 'ThisExpression' ? 'this' : '');
+      const propName = callee.property?.name || callee.property?.value || '';
+      const fullName = objName ? `${objName}.${propName}` : propName;
+      return {
+        calleeName: fullName || null,
+        isMethodCall: true,
+        objectName: objName || undefined,
+        methodName: propName || undefined,
+        isComputed,
+      };
+    }
+
+    return { calleeName: null, isMethodCall: false, isComputed: false };
   }
 
   private detectRecursion() {
     for (const [name, fn] of this.functions.entries()) {
-      const callsSelf = fn.calls.some(c => c.calleeName === name);
+      const callsSelf = fn.calls.some(c => {
+        const target = this.resolveCallee(c.calleeName);
+        return target?.name === name || c.calleeName === name;
+      });
       if (callsSelf) fn.isRecursive = true;
     }
   }
 
+  public resolveCallee(calleeName: string): FunctionSummary | undefined {
+    if (!calleeName) return undefined;
+
+    // 1. Direct function match
+    const direct = this.functions.get(calleeName);
+    if (direct) return direct;
+
+    // 2. Check alias map
+    const aliased = this.aliases.get(calleeName);
+    if (aliased) {
+      const target = this.functions.get(aliased);
+      if (target) return target;
+    }
+
+    // 3. If method call "builder.build", check if "build" is registered or "Builder.build"
+    if (calleeName.includes('.')) {
+      const [obj, method] = calleeName.split('.');
+      // Check if obj is an alias to another object or if method alone is unique
+      for (const [key, fn] of this.functions.entries()) {
+        if (key.endsWith(`.${method}`) || key === method) {
+          return fn;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
   public getFunction(name: string): FunctionSummary | undefined {
-    return this.functions.get(name);
+    return this.resolveCallee(name);
   }
 }

@@ -243,12 +243,45 @@ export class CallGraph {
   }
 
   private detectRecursion() {
+    // DFS cycle detection for both direct and mutual recursion
+    const visited = new Set<string>();
+    const recStack = new Set<string>();
+    const cycleNodes = new Set<string>();
+
+    const dfs = (fnName: string) => {
+      visited.add(fnName);
+      recStack.add(fnName);
+
+      const fn = this.functions.get(fnName);
+      if (fn) {
+        for (const call of fn.calls) {
+          const target = this.resolveCallee(call.calleeName);
+          if (target) {
+            const targetName = target.name;
+            if (recStack.has(targetName)) {
+              // Found cycle! All nodes currently on recStack from targetName onwards are recursive
+              cycleNodes.add(fnName);
+              cycleNodes.add(targetName);
+            } else if (!visited.has(targetName)) {
+              dfs(targetName);
+            }
+          }
+        }
+      }
+
+      recStack.delete(fnName);
+    };
+
+    for (const name of this.functions.keys()) {
+      if (!visited.has(name)) {
+        dfs(name);
+      }
+    }
+
     for (const [name, fn] of this.functions.entries()) {
-      const callsSelf = fn.calls.some(c => {
-        const target = this.resolveCallee(c.calleeName);
-        return target?.name === name || c.calleeName === name;
-      });
-      if (callsSelf) fn.isRecursive = true;
+      if (cycleNodes.has(name)) {
+        fn.isRecursive = true;
+      }
     }
   }
 

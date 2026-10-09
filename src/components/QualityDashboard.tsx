@@ -255,9 +255,11 @@ export const QualityDashboard: React.FC = () => {
                         <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5 font-mono">
                           <span className="capitalize">{res.category.replace('_', ' ')}</span>
                           <span className="text-slate-600">·</span>
-                          <span>Outcome: {res.actualVulnerable ? 'VULNERABLE SINK REACHED' : res.actualSanitized ? 'SANITIZED (CLEAN)' : 'SAFE (PARAMETERIZED)'}</span>
+                          <span className={res.actualVulnerable ? (res.actualConfidence === 'unresolved_flow' ? 'text-amber-400' : 'text-rose-400') : 'text-emerald-400'}>
+                            {res.actualVulnerable ? (res.actualConfidence === 'unresolved_flow' ? 'UNRESOLVED FLOW (CONSERVATIVE)' : 'VULNERABLE SINK REACHED') : res.actualSanitized ? 'SANITIZED (CLEAN)' : 'SAFE (OVERWRITTEN / BOUND)'}
+                          </span>
                           <span className="text-slate-600">·</span>
-                          <span>{res.stepsCount} trace hops</span>
+                          <span className="text-slate-500">{res.verificationMode === 'EXACT_TRACE' ? `${res.stepsCount} trace hops` : 'safe post-state verified'}</span>
                           <span className="text-slate-600">·</span>
                           <span>{res.durationMs}ms</span>
                         </div>
@@ -265,6 +267,9 @@ export const QualityDashboard: React.FC = () => {
                     </div>
 
                     <div className="flex items-center gap-2 font-mono text-[11px]">
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-400 border border-slate-700">
+                        {res.verificationMode === 'EXACT_TRACE' ? 'EXACT TRACE' : 'STATE & ABSENCE'}
+                      </span>
                       <span className={`px-2 py-0.5 rounded border ${
                         res.passed
                           ? 'text-emerald-400 border-emerald-800/60 bg-emerald-950/40'
@@ -286,7 +291,33 @@ export const QualityDashboard: React.FC = () => {
                         </div>
                       )}
 
-                      {res.expectedPathSequence && (
+                      {/* State Verification for Safe Cases */}
+                      {res.expectedPostState && (
+                        <div className="p-2.5 rounded bg-slate-900 border border-slate-800 text-[11px] font-mono space-y-1.5">
+                          <div className="text-slate-400 font-semibold flex items-center justify-between">
+                            <span className="text-emerald-400">Post-Execution Data-Flow State Verification:</span>
+                            <span className="text-emerald-400 text-[10px] bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-800/60">
+                              {res.dataFlowStateVerified ? 'STATE MATCH CONFIRMED' : 'STATE MISMATCH'}
+                            </span>
+                          </div>
+                          <div className="space-y-1 text-[10px] text-slate-300">
+                            {Object.entries(res.expectedPostState).map(([varName, expState]) => {
+                              const actState = res.finalVariables[varName];
+                              return (
+                                <div key={varName} className="flex items-center justify-between bg-slate-950/50 px-2 py-1 rounded">
+                                  <span>Variable <code>{varName}</code>:</span>
+                                  <span>
+                                    Expected: <strong className={expState.isTainted ? 'text-amber-400' : 'text-emerald-400'}>{expState.isTainted ? 'TAINTED' : 'SAFE'}</strong>
+                                    {' '}| Actual: <strong className={actState?.isTainted ? 'text-amber-400' : 'text-emerald-400'}>{actState?.isTainted ? 'TAINTED' : 'SAFE'}</strong>
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {res.expectedPathSequence && res.expectedPathSequence.length > 0 && (
                         <div className="p-2 rounded bg-slate-900 border border-slate-800 text-[10px] font-mono space-y-1">
                           <div className="text-slate-400">
                             <span className="text-slate-500">Expected Sequence: </span>

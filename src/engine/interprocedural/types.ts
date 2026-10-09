@@ -2,6 +2,17 @@ import { ASTNode } from '../ast/types';
 
 export type TaintThreatType = 'SQL_INJECTION' | 'COMMAND_INJECTION' | 'PATH_TRAVERSAL' | 'XSS';
 
+export type SinkContext = 
+  | 'SQL_QUERY'
+  | 'HTML_BODY'
+  | 'HTML_ATTRIBUTE'
+  | 'JAVASCRIPT_CONTEXT'
+  | 'URL_CONTEXT'
+  | 'COMMAND_EXEC'
+  | 'PATH_RESOLVE';
+
+export type VulnerabilityConfidence = 'confirmed' | 'unresolved_flow';
+
 export type InterproceduralStepType = 
   | 'SOURCE'
   | 'ARGUMENT'
@@ -28,6 +39,10 @@ export interface InterproceduralPathStep {
 export interface InterproceduralTaintVulnerability {
   id: string;
   vulnerabilityType: TaintThreatType;
+  confidence?: VulnerabilityConfidence;
+  isUnresolvedFlow?: boolean;
+  unresolvedFunction?: string;
+  sinkContext?: SinkContext;
   source: {
     file: string;
     line: number;
@@ -76,6 +91,12 @@ export interface FunctionSummary {
 
 export type AnalysisConvergenceStatus = 'converged' | 'resource_limit_exceeded';
 
+export interface FinalVariableState {
+  isTainted: boolean;
+  sanitized?: boolean;
+  threat?: TaintThreatType;
+}
+
 export interface InterproceduralAnalysisResult {
   vulnerabilities: InterproceduralTaintVulnerability[];
   iterations: number;
@@ -83,10 +104,12 @@ export interface InterproceduralAnalysisResult {
   status: AnalysisConvergenceStatus;
   unresolvedCallsCount: number;
   flowSensitiveStepsEvaluated: number;
+  finalVariables: Record<string, FinalVariableState>;
 }
 
 export interface SanitizerDefinition {
   name: string;
   neutralizesThreats: TaintThreatType[];
+  validContexts: SinkContext[];
   description: string;
 }

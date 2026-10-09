@@ -29,12 +29,21 @@ function sanitizeForAcorn(sourceCode: string): string {
   code = code.replace(/([A-Za-z0-9_\])])!([.[\s])/g, '$1$2');
 
   // 7. Strip simple JSX elements to mock function calls if present: <div ...> -> React.createElement('div')
-  // We keep line numbers aligned by replacing with equal line breaks
+  // Protect string literals (single quotes, double quotes, template literals) from JSX regex
+  const stringLiterals: string[] = [];
+  code = code.replace(/(["'`])(?:\\.|(?!\1)[^\\])*?\1/gs, (match) => {
+    stringLiterals.push(match);
+    return `__STR_LITERAL_${stringLiterals.length - 1}__`;
+  });
+
   code = code.replace(/<([A-Za-z0-9_.]+)([^>]*)>(.*?)<\/\1>/gs, (match, tag) => {
     const linesCount = (match.match(/\n/g) || []).length;
     return `/* JSX <${tag}> */` + '\n'.repeat(linesCount);
   });
   code = code.replace(/<([A-Za-z0-9_.]+)([^>]*)\/>/g, '/* JSX self-close */');
+
+  // Restore string literals
+  code = code.replace(/__STR_LITERAL_(\d+)__/g, (_, idx) => stringLiterals[Number(idx)]);
 
   return code;
 }

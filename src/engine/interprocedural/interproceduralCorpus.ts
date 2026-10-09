@@ -994,4 +994,146 @@ const cleanVal = 'safe_string';`,
       cleanVal: { isTainted: false, mustExist: true },
     },
   },
+
+  // =========================================================================
+  // IP-41: Single-Statement Branch Merging (No Braces)
+  // =========================================================================
+  {
+    id: 'IP-41',
+    name: 'Branch-Sensitive State Merging: Single Statement Without Braces',
+    category: 'branch_merging',
+    description: 'Calculates union of states across single statement consequent and alternate branches without block braces.',
+    code: `let id = 'initial_clean';
+if (checkFlag()) id = req.query.id; else id = 'safe_literal';
+db.query('SELECT * FROM users WHERE id = ' + id);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'PROPAGATION', 'PROPAGATION', 'SINK'],
+    expectedPostState: {
+      id: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-42: Multi-Branch Else-If Chain Union Merging
+  // =========================================================================
+  {
+    id: 'IP-42',
+    name: 'Branch-Sensitive State Merging: Multi-Branch Else-If Chain',
+    category: 'branch_merging',
+    description: 'Multi-branch if-else if-else chain where one path preserves tainted input; merged state accurately unioned.',
+    code: `let id = 'clean';
+if (flagA()) {
+  id = 'safe_a';
+} else if (flagB()) {
+  id = 'safe_b';
+} else {
+  id = req.query.id;
+}
+db.query('SELECT * FROM users WHERE id = ' + id);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'PROPAGATION', 'PROPAGATION', 'PROPAGATION', 'SINK'],
+    expectedPostState: {
+      id: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-43: Abstract-State String Constant Sensitivity (Concept 5.2 Finding 1)
+  // =========================================================================
+  {
+    id: 'IP-43',
+    name: 'Abstract-State String Constant Sensitivity in Recursive Fixed-Point',
+    category: 'recursion',
+    description: 'Ensures parameter-sensitive summary distinguishes different string constants so recursive state stabilization does not conflate different string queries.',
+    code: `function buildSql(param, mode) {
+  if (mode === 'admin') {
+    return 'SELECT * FROM admin WHERE key = ' + param;
+  }
+  return 'SELECT * FROM public WHERE key = ' + param;
+}
+
+const input = req.query.key;
+const q1 = buildSql(input, 'admin');
+db.query(q1);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedConvergenceStatus: 'converged',
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedPostState: {
+      input: { isTainted: true, mustExist: true },
+      q1: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-44: Number() Disallowed in HTML_BODY Context (Concept 5.2 Finding 2)
+  // =========================================================================
+  {
+    id: 'IP-44',
+    name: 'Sanitizer Policy: Number() Casting Disallowed in HTML Body Context',
+    category: 'context_sanitization',
+    description: 'Enforces strict context policy: numeric casts are valid for SQL/command/path, but NOT for HTML body sinks (res.send). Taint remains unneutralized.',
+    code: `const count = req.query.count;
+const safeNum = Number(count);
+res.send('<div>Count: ' + safeNum + '</div>');`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
+    expectedPostState: {
+      count: { isTainted: true, mustExist: true },
+      safeNum: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-45: User-Defined Function Name Matching Built-in Sanitizer (Concept 5.2 Finding 2)
+  // =========================================================================
+  {
+    id: 'IP-45',
+    name: 'Sanitizer Trust: User-Defined Function Not Blindly Trusted by Name',
+    category: 'sanitizer',
+    description: 'A user-defined function named escapeHtml or sanitizeUrl that simply returns un-sanitized input is analyzed by its implementation and not trusted by name alone.',
+    code: `function escapeHtml(val) {
+  return val; // Flawed user implementation
+}
+
+const raw = req.query.msg;
+const safe = escapeHtml(raw);
+res.send('<div>' + safe + '</div>');`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedPostState: {
+      raw: { isTainted: true, mustExist: true },
+      safe: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-46: URL Sink Destination vs Component Analysis (Concept 5.2 Finding 3)
+  // =========================================================================
+  {
+    id: 'IP-46',
+    name: 'URL Destination vs Component: Scheme Concatenation Remains Destination',
+    category: 'context_sanitization',
+    description: 'String concatenation forming a destination scheme (e.g. scheme + host) is analyzed as URL_DESTINATION, not blindly treated as URL_COMPONENT by syntactic + operator.',
+    code: `const host = req.query.host;
+const encodedHost = encodeURIComponent(host);
+location.href = 'javascript:' + encodedHost;`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'SANITIZER', 'SINK'],
+    expectedPostState: {
+      host: { isTainted: true, mustExist: true },
+      encodedHost: { isTainted: true, mustExist: true },
+    },
+  },
 ];

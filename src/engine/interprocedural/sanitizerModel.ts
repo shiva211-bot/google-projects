@@ -4,37 +4,37 @@ export const KNOWN_SANITIZERS: SanitizerDefinition[] = [
   {
     name: 'Number',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE', 'HTML_BODY'],
-    description: 'Casts input to numeric primitive. Valid for numeric SQL IDs, commands, and paths. NOT valid for HTML attributes or full URLs.',
+    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE'],
+    description: 'Casts input to numeric primitive. Valid for numeric SQL IDs, commands, and paths. NOT valid for HTML body, HTML attributes, or full URLs.',
   },
   {
     name: 'parseInt',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE', 'HTML_BODY'],
+    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE'],
     description: 'Parses integer value. Strips SQL quotes, operators, and injection strings.',
   },
   {
     name: 'parseFloat',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE', 'HTML_BODY'],
+    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE'],
     description: 'Parses floating point number, stripping injection payloads.',
   },
   {
     name: 'Math.floor',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE', 'HTML_BODY'],
+    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE'],
     description: 'Numeric mathematical floor conversion, stripping injection strings.',
   },
   {
     name: 'Math.round',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE', 'HTML_BODY'],
+    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE'],
     description: 'Numeric mathematical round conversion, stripping injection strings.',
   },
   {
     name: 'Math.ceil',
     neutralizesThreats: ['SQL_INJECTION', 'COMMAND_INJECTION', 'PATH_TRAVERSAL'],
-    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE', 'HTML_BODY'],
+    validContexts: ['SQL_QUERY', 'COMMAND_EXEC', 'PATH_RESOLVE'],
     description: 'Numeric mathematical ceiling conversion, stripping injection strings.',
   },
   {
@@ -75,12 +75,30 @@ export const KNOWN_SANITIZERS: SanitizerDefinition[] = [
   },
 ];
 
+// Standard language / runtime built-in sanitizers that are always available globally
+export const STANDARD_BUILTIN_SANITIZERS = new Set<string>([
+  'number',
+  'parseint',
+  'parsefloat',
+  'math.floor',
+  'math.round',
+  'math.ceil',
+  'encodeuricomponent',
+]);
+
 export function lookupSanitizer(name: string): SanitizerDefinition | undefined {
   const normalized = name.trim().toLowerCase();
   return KNOWN_SANITIZERS.find(s => s.name.toLowerCase() === normalized);
 }
 
+// Built-ins guaranteed by runtime environment (Number, parseInt, Math.floor, encodeURIComponent)
 export function isBuiltinSanitizer(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  return STANDARD_BUILTIN_SANITIZERS.has(normalized);
+}
+
+// Recognizes verified sanitizer library / helper names when explicitly not overridden by untrusted user logic
+export function isKnownSanitizer(name: string): boolean {
   return lookupSanitizer(name) !== undefined;
 }
 

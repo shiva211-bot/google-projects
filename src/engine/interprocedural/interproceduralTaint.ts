@@ -3,7 +3,8 @@ import { CallGraph } from './callGraph';
 import { 
   doesNeutralizeThreat, 
   doesNeutralizeThreatInContext, 
-  isBuiltinSanitizer 
+  isBuiltinSanitizer,
+  isKnownSanitizer
 } from './sanitizerModel';
 import { 
   InterproceduralTaintVulnerability, 
@@ -57,6 +58,9 @@ export function isAbstractStateEqual(a: TaintValue | null, b: TaintValue | null)
   if (a.sanitizerStep?.name !== b.sanitizerStep?.name) return false;
   if (a.sanitizerStep?.neutralizesThreat !== b.sanitizerStep?.neutralizesThreat) return false;
 
+  // Compare statically tracked string constant content (Finding 1)
+  if (a.stringValue !== b.stringValue) return false;
+
   return true;
 }
 
@@ -67,16 +71,36 @@ export function joinAbstractValues(
   mergeStep?: InterproceduralPathStep
 ): TaintValue | null {
   if (!a && !b) return null;
-  if (!a) return b;
-  if (!b) return a;
+  if (!a) {
+    if (b && b.isTainted && mergeStep) {
+      return { ...b, history: [...b.history, { ...mergeStep, stepNumber: b.history.length + 1 }] };
+    }
+    return b;
+  }
+  if (!b) {
+    if (a && a.isTainted && mergeStep) {
+      return { ...a, history: [...a.history, { ...mergeStep, stepNumber: a.history.length + 1 }] };
+    }
+    return a;
+  }
 
-  if (!a.isTainted && !b.isTainted) return null;
+  if (!a.isTainted && !b.isTainted) {
+    const stringVal = (a.stringValue === b.stringValue) ? a.stringValue : (a.stringValue || b.stringValue);
+    return {
+      isTainted: false,
+      threat: 'UNTRUSTED',
+      sanitized: false,
+      history: [],
+      stringValue: stringVal,
+    };
+  }
+
   if (a.isTainted && !b.isTainted) {
-    if (mergeStep) return { ...a, history: [...a.history, mergeStep] };
+    if (mergeStep) return { ...a, history: [...a.history, { ...mergeStep, stepNumber: a.history.length + 1 }] };
     return a;
   }
   if (!a.isTainted && b.isTainted) {
-    if (mergeStep) return { ...b, history: [...b.history, mergeStep] };
+    if (mergeStep) return { ...b, history: [...b.history, { ...mergeStep, stepNumber: b.history.length + 1 }] };
     return b;
   }
 
@@ -84,6 +108,7 @@ export function joinAbstractValues(
   // Safety rule: Un-sanitized taint dominates over sanitized
   const isSanitized = a.sanitized && b.sanitized;
   const dominant = (!a.sanitized && b.sanitized) ? a : ((a.sanitized && !b.sanitized) ? b : a);
+  const dominantThreat = (a.threat !== 'UNTRUSTED' ? a.threat : b.threat) || dominant.threat;
 
   // Union of tainted object properties
   let mergedProps: Set<string> | undefined = undefined;
@@ -93,11 +118,13 @@ export function joinAbstractValues(
 
   const isUnres = !!a.isUnresolvedFlow || !!b.isUnresolvedFlow;
   const unresFn = a.unresolvedFunction || b.unresolvedFunction;
-  const baseHistory = mergeStep ? [...dominant.history, mergeStep] : dominant.history;
+  const baseHistory = mergeStep 
+    ? [...dominant.history, { ...mergeStep, stepNumber: dominant.history.length + 1 }] 
+    : dominant.history;
 
   return {
     isTainted: true,
-    threat: dominant.threat,
+    threat: dominantThreat,
     sanitized: isSanitized,
     sanitizerStep: isSanitized ? dominant.sanitizerStep : undefined,
     properties: mergedProps,
@@ -178,6 +205,18 @@ export function runFlowSensitiveInterproceduralAnalysis(
     return `global::${varName}`;
   }
 
+  function getDeclarationScope(declScope: LexicalScope, kind?: string): LexicalScope {
+    if (kind !== 'var') return declScope;
+    let curr = declScope;
+    while (
+      curr.parent && 
+      (curr.name === 'if_block' || curr.name === 'else_block' || curr.name === 'block' || curr.name === 'loop_block')
+    ) {
+      curr = curr.parent;
+    }
+    return curr;
+  }
+
   function extractMemberString(expr: any): string {
     if (!expr) return '';
     if (expr.type === 'Identifier') return expr.name;
@@ -245,15 +284,73 @@ export function runFlowSensitiveInterproceduralAnalysis(
     return hasPlaceholders && hasParams;
   }
 
+  // URL Destination vs Component Context Analysis (Finding 3):
+  // Replaces syntactic binary '+' shortcut with semantic destination-versus-component analysis.
+  // Determines if the assigned / passed expression forms a component of a fixed base URL
+  // or a complete destination URL where protocol / host can be influenced.
+  function analyzeUrlSinkContext(
+    expr: any,
+    env: Map<string, TaintValue | null>,
+    scope: LexicalScope,
+    callStack: string[]
+  ): SinkContext {
+    if (!expr) return 'URL_DESTINATION';
+
+    // 1. Binary concatenation: inspect left prefix
+    if (expr.type === 'BinaryExpression' && expr.operator === '+') {
+      const leftEval = evaluateExpression(expr.left, env, scope, callStack);
+      const prefixStr = leftEval?.stringValue;
+      if (typeof prefixStr === 'string') {
+        const trimmed = prefixStr.trim().toLowerCase();
+        // Complete destination if the prefix contains scheme or is protocol-relative
+        if (/^(https?:|\/\/|\/)/i.test(trimmed)) {
+          // If prefix ends with query separator or path slash (e.g. '/search?q=', 'https://example.com/api?param='),
+          // the concatenated suffix is a URL_COMPONENT
+          if (trimmed.includes('?') || trimmed.includes('&') || trimmed.endsWith('/')) {
+            return 'URL_COMPONENT';
+          }
+          // Concatenating directly to scheme without safe boundary (e.g. "javascript:" + code) is URL_DESTINATION
+          return 'URL_DESTINATION';
+        }
+      }
+      // If prefix is not a fixed safe base path/query, treat conservatively as complete destination
+      return 'URL_DESTINATION';
+    }
+
+    // 2. Template literal: inspect initial quasi prefix
+    if (expr.type === 'TemplateLiteral') {
+      const firstQuasi = expr.quasis?.[0]?.value?.raw || '';
+      const trimmed = firstQuasi.trim().toLowerCase();
+      if ((trimmed.startsWith('/') || trimmed.startsWith('http://') || trimmed.startsWith('https://')) &&
+          (trimmed.includes('?') || trimmed.includes('&') || trimmed.endsWith('/'))) {
+        return 'URL_COMPONENT';
+      }
+      return 'URL_DESTINATION';
+    }
+
+    // 3. Direct identifier, member expression, or call expression without base prefix is a complete destination
+    return 'URL_DESTINATION';
+  }
+
   function buildParamSignature(args: (TaintValue | null)[]): string {
     return args
       .map(a => {
-        if (!a || !a.isTainted) return 'safe';
+        if (!a || !a.isTainted) {
+          if (a?.stringValue !== undefined) {
+            // Encode string literal in bounded abstract domain
+            const encodedStr = encodeURIComponent(a.stringValue.slice(0, 64));
+            return `str:${encodedStr}`;
+          }
+          return 'safe';
+        }
         const propsStr = a.properties && a.properties.size > 0 
           ? `[${Array.from(a.properties).sort().join(';')}]` 
           : '*';
         const unresStr = a.isUnresolvedFlow ? ':unres' : '';
-        return `${a.threat}:${a.sanitized ? 'sanitized' : 'tainted'}:${propsStr}${unresStr}`;
+        const strSuffix = a.stringValue !== undefined 
+          ? `:str(${encodeURIComponent(a.stringValue.slice(0, 64))})` 
+          : '';
+        return `${a.threat}:${a.sanitized ? 'sanitized' : 'tainted'}:${propsStr}${unresStr}${strSuffix}`;
       })
       .join('|');
   }
@@ -497,36 +594,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         return null;
       }
 
-      // Check if built-in sanitizer: Number(), parseInt(), escapeHtml(), encodeURIComponent(), etc.
-      if (isBuiltinSanitizer(calleeName)) {
-        if (firstTaintedArg) {
-          const line = expr.loc?.start?.line || 1;
-          const step: InterproceduralPathStep = {
-            stepNumber: firstTaintedArg.history.length + 1,
-            type: 'SANITIZER',
-            line,
-            function: scope.name !== 'global' ? scope.name : undefined,
-            functionName: scope.name,
-            symbol: calleeName,
-            description: `Passed through sanitizer '${calleeName}()'`,
-          };
-
-          return {
-            isTainted: true,
-            threat: firstTaintedArg.threat,
-            sanitized: true,
-            sanitizerStep: {
-              line,
-              name: calleeName,
-              neutralizesThreat: true,
-            },
-            history: [...firstTaintedArg.history, step],
-          };
-        }
-        return null;
-      }
-
-      // Check if user function resolved in CallGraph
+      // 1. Check if user function resolved in CallGraph (priority over name-matching)
       const resolvedTarget = callGraph.resolveCallee(calleeName);
       if (resolvedTarget) {
         const paramSig = buildParamSignature(evaluatedArgs);
@@ -635,6 +703,35 @@ export function runFlowSensitiveInterproceduralAnalysis(
         return finalRet;
       }
 
+      // 2. Verified built-in or verified library sanitizer (NOT defined/overridden by user AST)
+      if (isBuiltinSanitizer(calleeName) || isKnownSanitizer(calleeName)) {
+        if (firstTaintedArg) {
+          const line = expr.loc?.start?.line || 1;
+          const step: InterproceduralPathStep = {
+            stepNumber: firstTaintedArg.history.length + 1,
+            type: 'SANITIZER',
+            line,
+            function: scope.name !== 'global' ? scope.name : undefined,
+            functionName: scope.name,
+            symbol: calleeName,
+            description: `Passed through sanitizer '${calleeName}()'`,
+          };
+
+          return {
+            isTainted: true,
+            threat: firstTaintedArg.threat,
+            sanitized: true,
+            sanitizerStep: {
+              line,
+              name: calleeName,
+              neutralizesThreat: true,
+            },
+            history: [...firstTaintedArg.history, step],
+          };
+        }
+        return null;
+      }
+
       // Unresolved call -> Conservative propagation as unresolved-flow finding
       if (firstTaintedArg) {
         unresolvedCallsCount++;
@@ -675,13 +772,21 @@ export function runFlowSensitiveInterproceduralAnalysis(
   ): { env: Map<string, TaintValue | null>; returnValue: TaintValue | null } {
     if (!bodyNode) return { env, returnValue: null };
 
-    // Arrow function with expression body
-    if (bodyNode.type !== 'BlockStatement' && bodyNode.type !== 'Program') {
+    let statements: any[] = [];
+    if (bodyNode.type === 'BlockStatement' || bodyNode.type === 'Program') {
+      statements = bodyNode.body || [];
+    } else if (
+      bodyNode.type?.endsWith('Statement') || 
+      bodyNode.type?.endsWith('Declaration') ||
+      bodyNode.type === 'IfStatement'
+    ) {
+      statements = [bodyNode];
+    } else {
+      // Arrow function with expression body (or bare expression)
       const retVal = evaluateExpression(bodyNode, env, scope, callStack);
       return { env, returnValue: retVal };
     }
 
-    const statements = bodyNode.body || [];
     let currentEnv = new Map(env);
     let capturedReturn: TaintValue | null = null;
 
@@ -695,8 +800,9 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const init = decl.init;
 
           if (varName) {
-            scope.declarations.add(varName);
-            const varKey = `${scope.id}::${varName}`;
+            const targetScope = getDeclarationScope(scope, stmt.kind);
+            targetScope.declarations.add(varName);
+            const varKey = `${targetScope.id}::${varName}`;
             const evalVal = evaluateExpression(init, currentEnv, scope, callStack);
 
             if (evalVal && evalVal.isTainted) {
@@ -735,8 +841,9 @@ export function runFlowSensitiveInterproceduralAnalysis(
             for (const prop of decl.id.properties || []) {
               const propName = prop.key?.name || prop.value?.name;
               if (propName) {
-                scope.declarations.add(propName);
-                const propKey = `${scope.id}::${propName}`;
+                const targetScope = getDeclarationScope(scope, stmt.kind);
+                targetScope.declarations.add(propName);
+                const propKey = `${targetScope.id}::${propName}`;
 
                 if (initVal && initVal.isTainted) {
                   const line = stmt.loc?.start?.line || 1;
@@ -776,6 +883,9 @@ export function runFlowSensitiveInterproceduralAnalysis(
         if (expr?.type === 'AssignmentExpression') {
           const leftName = expr.left?.name;
           if (leftName) {
+            if (scope.name === 'global') {
+              globalScope.declarations.add(leftName);
+            }
             const varKey = resolveVarKey(scope, leftName);
             const evalVal = evaluateExpression(expr.right, currentEnv, scope, callStack);
 
@@ -845,9 +955,16 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
       // 5. IfStatement: Branch-Sensitive State Merging via Join Lattice
       else if (stmt.type === 'IfStatement') {
+        if (stmt.test) {
+          if (stmt.test.type === 'CallExpression') {
+            checkSinkInvocation(stmt.test, currentEnv, scope, callStack);
+          }
+          evaluateExpression(stmt.test, currentEnv, scope, callStack);
+        }
+
         const priorEnv = new Map(currentEnv);
 
-        // Path 1: Consequent branch
+        // Path 1: Consequent branch evaluated in isolated branch scope
         let ifEnv = new Map(priorEnv);
         if (stmt.consequent) {
           const ifScope = createScope('if_block', scope);
@@ -860,7 +977,8 @@ export function runFlowSensitiveInterproceduralAnalysis(
           }
         }
 
-        // Path 2: Alternate branch
+        // Path 2: Alternate branch evaluated in isolated branch scope
+        // If alternate is omitted, unexecuted path retains prior environment
         let elseEnv = new Map(priorEnv);
         if (stmt.alternate) {
           const elseScope = createScope('else_block', scope);
@@ -874,6 +992,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         }
 
         // Merge ifEnv and elseEnv back into currentEnv using join lattice
+        // Calculating the union of tainted states from consequent and alternate branches
         const allKeys = new Set([...ifEnv.keys(), ...elseEnv.keys(), ...priorEnv.keys()]);
 
         for (const varKey of allKeys) {
@@ -881,7 +1000,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const valElse = elseEnv.get(varKey);
 
           const branchStep: InterproceduralPathStep = {
-            stepNumber: 1, // Will be offset in joinAbstractValues
+            stepNumber: 1, // Offset dynamically in joinAbstractValues
             type: 'PROPAGATION',
             line: stmt.loc?.start?.line || 1,
             function: scope.name !== 'global' ? scope.name : undefined,
@@ -892,6 +1011,26 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
           const mergedVal = joinAbstractValues(valIf || null, valElse || null, branchStep);
           currentEnv.set(varKey, mergedVal);
+        }
+      }
+
+      // 6. Loops: evaluate loop body in loop scope
+      else if (
+        stmt.type === 'ForStatement' ||
+        stmt.type === 'ForInStatement' ||
+        stmt.type === 'ForOfStatement' ||
+        stmt.type === 'WhileStatement' ||
+        stmt.type === 'DoWhileStatement'
+      ) {
+        if (stmt.body) {
+          const loopScope = createScope('loop_block', scope);
+          const loopRes = analyzeBlockStatements(stmt.body, currentEnv, loopScope, callStack);
+          currentEnv = loopRes.env;
+          if (loopRes.returnValue) {
+            capturedReturn = capturedReturn
+              ? joinAbstractValues(capturedReturn, loopRes.returnValue)
+              : loopRes.returnValue;
+          }
         }
       }
     }
@@ -920,12 +1059,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
     if (objectName === 'location' && propName === 'href') {
       // Determine if right-hand side is a full destination or query component
-      const right = assignNode.right;
-      if (right?.type === 'BinaryExpression' && right.operator === '+') {
-        sinkContext = 'URL_COMPONENT';
-      } else {
-        sinkContext = 'URL_DESTINATION';
-      }
+      sinkContext = analyzeUrlSinkContext(assignNode.right, env, scope, callStack);
       sinkThreat = 'XSS';
     } else if (propName === 'innerhtml' || propName === 'outerhtml') {
       sinkContext = 'HTML_BODY';
@@ -1035,11 +1169,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     // 4. URL Sinks (window.open, location.href, setAttribute)
     else if (methodName === 'open' || (objectName === 'location' && methodName === 'href')) {
       const firstArg = callNode.arguments[0];
-      if (firstArg?.type === 'BinaryExpression' && firstArg.operator === '+') {
-        sinkContext = 'URL_COMPONENT';
-      } else {
-        sinkContext = 'URL_DESTINATION';
-      }
+      sinkContext = analyzeUrlSinkContext(firstArg, env, scope, callStack);
       sinkThreat = 'XSS';
     }
     // 5. HTML Attribute Sink (element.setAttribute)
@@ -1180,17 +1310,33 @@ export function runFlowSensitiveInterproceduralAnalysis(
             const pKey = `${fnScope.id}::${pName}`;
             const sigVal = sigParts[pIdx] || 'safe';
 
-            if (sigVal !== 'safe') {
+            if (sigVal.startsWith('str:')) {
+              const decodedStr = decodeURIComponent(sigVal.slice(4));
+              fnEnv.set(pKey, {
+                isTainted: false,
+                threat: 'UNTRUSTED',
+                sanitized: false,
+                history: [],
+                stringValue: decodedStr,
+              });
+            } else if (sigVal !== 'safe') {
               const segments = sigVal.split(':');
               const threat = (segments[0] || 'UNTRUSTED') as TaintThreatType;
               const isSanitized = segments[1] === 'sanitized';
               const isUnres = segments[3] === 'unres';
+              let trackedStr: string | undefined = undefined;
+              for (const seg of segments) {
+                if (seg.startsWith('str(') && seg.endsWith(')')) {
+                  trackedStr = decodeURIComponent(seg.slice(4, -1));
+                }
+              }
 
               fnEnv.set(pKey, {
                 isTainted: true,
                 threat,
                 sanitized: isSanitized,
                 isUnresolvedFlow: isUnres,
+                stringValue: trackedStr,
                 history: [{
                   stepNumber: 1,
                   type: 'PARAMETER',

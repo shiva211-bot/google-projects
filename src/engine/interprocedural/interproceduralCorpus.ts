@@ -1048,17 +1048,21 @@ db.query('SELECT * FROM users WHERE id = ' + id);`,
     id: 'IP-43',
     name: 'Abstract-State String Constant Sensitivity in Recursive Fixed-Point',
     category: 'recursion',
-    description: 'Ensures parameter-sensitive summary distinguishes different string constants so recursive state stabilization does not conflate different string queries.',
-    code: `function buildSql(param, mode) {
-  if (mode === 'admin') {
-    return 'SELECT * FROM admin WHERE key = ' + param;
+    description: 'A recursive function whose behavior depends on distinct string constant parameters, verifying that fixed-point iteration distinguishes different constant paths.',
+    code: `function recursiveQuery(param, mode, depth) {
+  if (depth <= 0) {
+    if (mode === 'admin') {
+      return 'SELECT * FROM admin WHERE key = ' + param;
+    }
+    return 'SELECT * FROM public WHERE key = ' + param;
   }
-  return 'SELECT * FROM public WHERE key = ' + param;
+  return recursiveQuery(param, mode, depth - 1);
 }
 
 const input = req.query.key;
-const q1 = buildSql(input, 'admin');
-db.query(q1);`,
+const qAdmin = recursiveQuery(input, 'admin', 2);
+const qPublic = recursiveQuery(input, 'public', 2);
+db.query(qAdmin);`,
     expectedVulnerable: true,
     expectedSanitized: false,
     expectedConfidence: 'confirmed',
@@ -1066,7 +1070,8 @@ db.query(q1);`,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
     expectedPostState: {
       input: { isTainted: true, mustExist: true },
-      q1: { isTainted: true, mustExist: true },
+      qAdmin: { isTainted: true, mustExist: true },
+      qPublic: { isTainted: true, mustExist: true },
     },
   },
 

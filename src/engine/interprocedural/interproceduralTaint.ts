@@ -650,6 +650,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
               properties: argVal.properties ? new Set(argVal.properties) : undefined,
               isUnresolvedFlow: argVal.isUnresolvedFlow,
               unresolvedFunction: argVal.unresolvedFunction,
+              stringValue: argVal.stringValue,
               history: [...argVal.history, stepArg, stepParam],
             };
 
@@ -687,6 +688,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             properties: calleeResult.returnValue.properties,
             isUnresolvedFlow: calleeResult.returnValue.isUnresolvedFlow,
             unresolvedFunction: calleeResult.returnValue.unresolvedFunction,
+            stringValue: calleeResult.returnValue.stringValue,
             history: [...calleeResult.returnValue.history, retStep],
           };
         } else {

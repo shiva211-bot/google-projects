@@ -1169,4 +1169,29 @@ res.send('<div>' + safe + '</div>');`,
       safe: { isTainted: true, mustExist: true },
     },
   },
+
+  // =========================================================================
+  // IP-48: Unknown Receiver Method Call (Unresolved Resolution)
+  // =========================================================================
+  {
+    id: 'IP-48',
+    name: 'Unknown Receiver Method Call Treated as Unresolved',
+    category: 'function_boundary',
+    description: 'When calling a method on an unknown receiver (e.g. unknownObject.escapeHtml), suffix matching is not used; the call is treated as unresolved and taint is propagated conservatively.',
+    code: `const objA = {
+  escapeHtml(val) { return 'safe_a'; }
+};
+
+const raw = req.query.msg;
+const safe = unknownObject.escapeHtml(raw);
+res.send('<div>' + safe + '</div>');`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'unresolved_flow',
+    expectedPathSequence: ['SOURCE', 'PROPAGATION', 'SINK'],
+    expectedPostState: {
+      raw: { isTainted: true, mustExist: true },
+      safe: { isTainted: true, mustExist: true },
+    },
+  },
 ];

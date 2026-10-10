@@ -299,27 +299,12 @@ export class CallGraph {
       if (target) return target;
     }
 
-    // 3. Qualified method call "receiver.method"
+    // 3. Qualified method call "receiver.method" requires exact receiver match ("obj.method" or "Class.method").
+    // Suffix-based inference on unknown receivers is prohibited to prevent false resolution.
     if (calleeName.includes('.')) {
       const [obj, method] = calleeName.split('.');
       const qualified = `${obj}.${method}`;
-      const exactQualified = this.functions.get(qualified);
-      if (exactQualified) return exactQualified;
-
-      // Check if method alone is unique across all registered functions (non-ambiguous check)
-      const matchingFunctions: FunctionSummary[] = [];
-      for (const [key, fn] of this.functions.entries()) {
-        if (key === method || key.endsWith(`.${method}`)) {
-          matchingFunctions.push(fn);
-        }
-      }
-
-      // If exactly one function matches this method name globally, and it has no conflicting receiver, use it.
-      // Otherwise, if ambiguous (multiple objects define the same method name), do NOT select arbitrarily.
-      if (matchingFunctions.length === 1) {
-        return matchingFunctions[0];
-      }
-      return undefined;
+      return this.functions.get(qualified);
     }
 
     return undefined;

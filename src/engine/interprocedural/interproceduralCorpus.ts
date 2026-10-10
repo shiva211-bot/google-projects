@@ -1141,4 +1141,32 @@ location.href = 'javascript:' + encodedHost;`,
       encodedHost: { isTainted: true, mustExist: true },
     },
   },
+
+  // =========================================================================
+  // IP-47: Ambiguous Method Resolution (Two objects with same method name)
+  // =========================================================================
+  {
+    id: 'IP-47',
+    name: 'Ambiguous Method Resolution: Multiple Objects with Same Method Name',
+    category: 'function_boundary',
+    description: 'When two different objects define the same method name (e.g. objA.escapeHtml vs objB.escapeHtml) and an ambiguous call occurs without exact receiver matching, resolution is treated as unresolved/unverified rather than picking arbitrarily.',
+    code: `const objA = {
+  escapeHtml(val) { return 'safe_a'; }
+};
+const objB = {
+  escapeHtml(val) { return val; } // Flawed
+};
+
+const raw = req.query.msg;
+const safe = objB.escapeHtml(raw);
+res.send('<div>' + safe + '</div>');`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'confirmed',
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedPostState: {
+      raw: { isTainted: true, mustExist: true },
+      safe: { isTainted: true, mustExist: true },
+    },
+  },
 ];

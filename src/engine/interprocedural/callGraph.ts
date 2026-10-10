@@ -288,7 +288,7 @@ export class CallGraph {
   public resolveCallee(calleeName: string): FunctionSummary | undefined {
     if (!calleeName) return undefined;
 
-    // 1. Direct function match
+    // 1. Direct function match or exact qualified method match ("obj.method" or "Class.method")
     const direct = this.functions.get(calleeName);
     if (direct) return direct;
 
@@ -299,15 +299,27 @@ export class CallGraph {
       if (target) return target;
     }
 
-    // 3. If method call "builder.build", check if "build" is registered or "Builder.build"
+    // 3. Qualified method call "receiver.method"
     if (calleeName.includes('.')) {
       const [obj, method] = calleeName.split('.');
-      // Check if obj is an alias to another object or if method alone is unique
+      const qualified = `${obj}.${method}`;
+      const exactQualified = this.functions.get(qualified);
+      if (exactQualified) return exactQualified;
+
+      // Check if method alone is unique across all registered functions (non-ambiguous check)
+      const matchingFunctions: FunctionSummary[] = [];
       for (const [key, fn] of this.functions.entries()) {
-        if (key.endsWith(`.${method}`) || key === method) {
-          return fn;
+        if (key === method || key.endsWith(`.${method}`)) {
+          matchingFunctions.push(fn);
         }
       }
+
+      // If exactly one function matches this method name globally, and it has no conflicting receiver, use it.
+      // Otherwise, if ambiguous (multiple objects define the same method name), do NOT select arbitrarily.
+      if (matchingFunctions.length === 1) {
+        return matchingFunctions[0];
+      }
+      return undefined;
     }
 
     return undefined;

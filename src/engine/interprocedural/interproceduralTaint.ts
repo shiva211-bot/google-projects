@@ -698,13 +698,6 @@ export function runFlowSensitiveInterproceduralAnalysis(
             return cached.returnVal;
           }
           // Bottom of lattice for initial approximation
-          if (!summaryCache.has(cacheKey)) {
-            summaryCache.set(cacheKey, {
-              returnVal: null,
-              iterations: 0,
-              converged: false,
-            });
-          }
           return null;
         }
 
@@ -796,7 +789,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         summaryCache.set(cacheKey, {
           returnVal: finalRet,
           iterations: 1,
-          converged: true,
+          converged: false,
         });
 
         return finalRet;
@@ -1054,28 +1047,22 @@ export function runFlowSensitiveInterproceduralAnalysis(
 
       // 5. IfStatement: Branch-Sensitive State Merging via Join Lattice
       else if (stmt.type === 'IfStatement') {
-        if (stmt.test) {
-          if (stmt.test.type === 'CallExpression') {
-            checkSinkInvocation(stmt.test, currentEnv, scope, callStack);
-          }
-          evaluateExpression(stmt.test, currentEnv, scope, callStack);
-        }
-
         let staticCondition: boolean | null = null;
-        if (stmt.test && stmt.test.type === 'BinaryExpression' && (stmt.test.operator === '===' || stmt.test.operator === '==')) {
-          const leftVal = evaluateExpression(stmt.test.left, currentEnv, scope, callStack);
-          const rightVal = evaluateExpression(stmt.test.right, currentEnv, scope, callStack);
-          const leftStr = leftVal?.stringValue;
-          const rightStr = rightVal?.stringValue;
-          if (typeof leftStr === 'string' && typeof rightStr === 'string') {
-            staticCondition = leftStr === rightStr;
+        if (stmt.test) {
+          if (stmt.test.type === 'BinaryExpression' && (stmt.test.operator === '===' || stmt.test.operator === '==')) {
+            const leftVal = evaluateExpression(stmt.test.left, currentEnv, scope, callStack);
+            const rightVal = evaluateExpression(stmt.test.right, currentEnv, scope, callStack);
+            if (leftVal?.stringValue !== undefined && rightVal?.stringValue !== undefined) {
+              staticCondition = leftVal.stringValue === rightVal.stringValue;
+            }
           }
         }
 
         const priorEnv = new Map(currentEnv);
-
-        // Path 1: Consequent branch evaluated in isolated branch scope
         let ifEnv = new Map(priorEnv);
+        let elseEnv = new Map(priorEnv);
+
+        // Path 1: Consequent
         if (staticCondition !== false && stmt.consequent) {
           const ifScope = createScope('if_block', scope);
           const ifRes = analyzeBlockStatements(stmt.consequent, new Map(priorEnv), ifScope, callStack);
@@ -1087,9 +1074,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
           }
         }
 
-        // Path 2: Alternate branch evaluated in isolated branch scope
-        // If alternate is omitted, unexecuted path retains prior environment
-        let elseEnv = new Map(priorEnv);
+        // Path 2: Alternate
         if (staticCondition !== true && stmt.alternate) {
           const elseScope = createScope('else_block', scope);
           const elseRes = analyzeBlockStatements(stmt.alternate, new Map(priorEnv), elseScope, callStack);
@@ -1102,7 +1087,6 @@ export function runFlowSensitiveInterproceduralAnalysis(
         }
 
         // Merge ifEnv and elseEnv back into currentEnv using join lattice
-        // Calculating the union of tainted states from consequent and alternate branches
         const allKeys = new Set([...ifEnv.keys(), ...elseEnv.keys(), ...priorEnv.keys()]);
 
         for (const varKey of allKeys) {
@@ -1110,7 +1094,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
           const valElse = elseEnv.get(varKey);
 
           const branchStep: InterproceduralPathStep = {
-            stepNumber: 1, // Offset dynamically in joinAbstractValues
+            stepNumber: 1,
             type: 'PROPAGATION',
             line: stmt.loc?.start?.line || 1,
             function: scope.name !== 'global' ? scope.name : undefined,
@@ -1407,97 +1391,122 @@ export function runFlowSensitiveInterproceduralAnalysis(
   // Detect recursive/cyclic functions in the CallGraph
   const recursiveFunctions = Array.from(callGraph.functions.values()).filter(fn => fn.isRecursive);
   if (recursiveFunctions.length > 0) {
-    let stateChanged = true;
-    while (stateChanged && iterations < MAX_ITERATIONS) {
-      stateChanged = false;
+    // Explicit Worklist-Based Fixed-Point Algorithm
+    const worklist = new Set<string>();
+    for (const key of summaryCache.keys()) {
+      worklist.add(key);
+      const rec = summaryCache.get(key);
+      if (rec) {
+        summaryCache.set(key, { ...rec, converged: false });
+      }
+    }
+
+    let iterations = 0;
+    let changed = true;
+    while (changed && iterations < MAX_ITERATIONS) {
+      changed = false;
       iterations++;
 
-      for (const recFn of recursiveFunctions) {
-        for (const [cacheKey, recRecord] of Array.from(summaryCache.entries())) {
-          if (!cacheKey.startsWith(`${recFn.name}::`)) continue;
+      if (worklist.size === 0) {
+        for (const key of summaryCache.keys()) {
+          worklist.add(key);
+        }
+      }
 
-          const paramSig = cacheKey.substring(`${recFn.name}::`.length);
-          const fnScope = createScope(recFn.name, null);
-          const fnEnv = new Map<string, TaintValue | null>();
+      const currentBatch = Array.from(worklist);
+      worklist.clear();
 
-          // Setup parameters from rich abstract signature
-          const sigParts = paramSig.split('|');
-          recFn.paramNames.forEach((pName, pIdx) => {
-            fnScope.declarations.add(pName);
-            const pKey = `${fnScope.id}::${pName}`;
-            const sigVal = sigParts[pIdx] || 'safe';
+      for (const cacheKey of currentBatch) {
+        const recFn = recursiveFunctions.find(fn => cacheKey.startsWith(`${fn.name}::`));
+        if (!recFn) continue;
+        const recRecord = summaryCache.get(cacheKey);
+        if (!recRecord) continue;
 
-            if (sigVal.startsWith('str:')) {
-              const decodedStr = decodeURIComponent(sigVal.slice(4));
-              fnEnv.set(pKey, {
-                isTainted: false,
-                threat: 'UNTRUSTED',
-                sanitized: false,
-                history: [],
-                stringValue: decodedStr,
-              });
-            } else if (sigVal.startsWith('num:')) {
-              const numVal = Number(sigVal.slice(4));
-              fnEnv.set(pKey, {
-                isTainted: false,
-                threat: 'UNTRUSTED',
-                sanitized: false,
-                history: [],
-                numberValue: numVal,
-              });
-            } else if (sigVal !== 'safe') {
-              const segments = sigVal.split(':');
-              const threat = (segments[0] || 'UNTRUSTED') as TaintThreatType;
-              const isSanitized = segments[1] === 'sanitized';
-              const isUnres = segments[3] === 'unres';
-              let trackedStr: string | undefined = undefined;
-              for (const seg of segments) {
-                if (seg.startsWith('str(') && seg.endsWith(')')) {
-                  trackedStr = decodeURIComponent(seg.slice(4, -1));
-                }
-              }
+        const paramSig = cacheKey.substring(`${recFn.name}::`.length);
+        const fnScope = createScope(recFn.name, null);
+        const fnEnv = new Map<string, TaintValue | null>();
 
-              fnEnv.set(pKey, {
-                isTainted: true,
-                threat,
-                sanitized: isSanitized,
-                isUnresolvedFlow: isUnres,
-                stringValue: trackedStr,
-                history: [{
-                  stepNumber: 1,
-                  type: 'PARAMETER',
-                  line: recFn.startLine,
-                  function: recFn.name,
-                  symbol: pName,
-                  description: `Parameter '${pName}' initialized for fixed-point iteration [${threat}]`,
-                }],
-              });
-            } else {
-              fnEnv.set(pKey, null);
-            }
-          });
+        // Setup parameters from rich abstract signature
+        const sigParts = paramSig.split('|');
+        recFn.paramNames.forEach((pName, pIdx) => {
+          fnScope.declarations.add(pName);
+          const pKey = `${fnScope.id}::${pName}`;
+          const sigVal = sigParts[pIdx] || 'safe';
 
-          // Re-evaluate recursive function body with current approximation
-          const res = analyzeBlockStatements(recFn.declarationNode.body, fnEnv, fnScope, []);
-          const prevVal = recRecord.returnVal;
-          const newVal = res.returnValue;
-
-          // Abstract state equality check: compares taint, threat, sanitized, properties, unresolved
-          if (!isAbstractStateEqual(prevVal, newVal)) {
-            summaryCache.set(cacheKey, {
-              returnVal: newVal,
-              iterations: recRecord.iterations + 1,
-              converged: true,
+          if (sigVal.startsWith('str:')) {
+            const decodedStr = decodeURIComponent(sigVal.slice(4));
+            fnEnv.set(pKey, {
+              isTainted: false,
+              threat: 'UNTRUSTED',
+              sanitized: false,
+              history: [],
+              stringValue: decodedStr,
             });
-            stateChanged = true;
+          } else if (sigVal.startsWith('num:')) {
+            const numVal = Number(sigVal.slice(4));
+            fnEnv.set(pKey, {
+              isTainted: false,
+              threat: 'UNTRUSTED',
+              sanitized: false,
+              history: [],
+              numberValue: numVal,
+            });
+          } else if (sigVal !== 'safe') {
+            const segments = sigVal.split(':');
+            const threat = (segments[0] || 'UNTRUSTED') as TaintThreatType;
+            const isSanitized = segments[1] === 'sanitized';
+            const isUnres = segments[3] === 'unres';
+            let trackedStr: string | undefined = undefined;
+            for (const seg of segments) {
+              if (seg.startsWith('str(') && seg.endsWith(')')) {
+                trackedStr = decodeURIComponent(seg.slice(4, -1));
+              }
+            }
+
+            fnEnv.set(pKey, {
+              isTainted: true,
+              threat,
+              sanitized: isSanitized,
+              isUnresolvedFlow: isUnres,
+              stringValue: trackedStr,
+              history: [{
+                stepNumber: 1,
+                type: 'PARAMETER',
+                line: recFn.startLine,
+                function: recFn.name,
+                symbol: pName,
+                description: `Parameter '${pName}' initialized for fixed-point iteration [${threat}]`,
+              }],
+            });
+          } else {
+            fnEnv.set(pKey, null);
           }
+        });
+
+        // Re-evaluate recursive function body with current approximation
+        const res = analyzeBlockStatements(recFn.declarationNode.body, fnEnv, fnScope, []);
+        const prevVal = recRecord.returnVal;
+        const newVal = res.returnValue;
+
+        if (!isAbstractStateEqual(prevVal, newVal)) {
+          summaryCache.set(cacheKey, {
+            returnVal: newVal,
+            iterations: recRecord.iterations + 1,
+            converged: false,
+          });
+          worklist.add(cacheKey);
+          changed = true;
         }
       }
     }
 
-    if (iterations >= MAX_ITERATIONS && stateChanged) {
+    if (iterations >= MAX_ITERATIONS && changed) {
       converged = false;
       analysisStatus = 'resource_limit_exceeded';
+    } else {
+      for (const [k, rec] of summaryCache.entries()) {
+        summaryCache.set(k, { ...rec, converged: true });
+      }
     }
   }
 

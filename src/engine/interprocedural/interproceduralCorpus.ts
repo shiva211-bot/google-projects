@@ -1219,4 +1219,59 @@ res.send('<div>' + safe + '</div>');`,
       safe: { isTainted: true, mustExist: true },
     },
   },
+
+  // =========================================================================
+  // IP-50: Resource Limit Exceeded in Recursive Fixed-Point
+  // =========================================================================
+  {
+    id: 'IP-50',
+    name: 'Recursive Fixed-Point Resource Limit Exceeded',
+    category: 'recursion',
+    description: 'A recursive function configuration whose fixed-point convergence exceeds maxIterations, correctly reporting resource_limit_exceeded status.',
+    code: `function infiniteRec(x, d) {
+      if (d <= 0) return x;
+      return infiniteRec(x + 'a', d + 1);
+    }
+    const val = req.query.msg;
+    const resVal = infiniteRec(val, 1);
+    db.query(resVal);`,
+    options: { maxIterations: 1 },
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConvergenceStatus: 'resource_limit_exceeded',
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedPostState: {
+      val: { isTainted: true, mustExist: true },
+      resVal: { isTainted: true, mustExist: true },
+    },
+  },
+
+  // =========================================================================
+  // IP-51: Mutual Recursion with Changing Summaries
+  // =========================================================================
+  {
+    id: 'IP-51',
+    name: 'Mutual Recursion with Changing Summaries',
+    category: 'recursion',
+    description: 'Mutually recursive functions functionA and functionB whose abstract states evolve and converge via the worklist algorithm.',
+    code: `function funcA(x, depth) {
+      if (depth <= 0) return x;
+      return funcB(x + '_a', depth - 1);
+    }
+    function funcB(x, depth) {
+      if (depth <= 0) return x;
+      return funcA(x + '_b', depth - 1);
+    }
+    const input = req.query.msg;
+    const result = funcA(input, 3);
+    db.query(result);`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConvergenceStatus: 'converged',
+    expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
+    expectedPostState: {
+      input: { isTainted: true, mustExist: true },
+      result: { isTainted: true, mustExist: true },
+    },
+  },
 ];

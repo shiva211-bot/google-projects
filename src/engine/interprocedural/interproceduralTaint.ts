@@ -698,6 +698,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             return cached.returnVal;
           }
           // Bottom of lattice for initial approximation
+          summaryCache.set(cacheKey, { returnVal: null, iterations: 0, converged: false });
           return null;
         }
 
@@ -1048,13 +1049,23 @@ export function runFlowSensitiveInterproceduralAnalysis(
       // 5. IfStatement: Branch-Sensitive State Merging via Join Lattice
       else if (stmt.type === 'IfStatement') {
         let staticCondition: boolean | null = null;
-        if (stmt.test) {
-          if (stmt.test.type === 'BinaryExpression' && (stmt.test.operator === '===' || stmt.test.operator === '==')) {
-            const leftVal = evaluateExpression(stmt.test.left, currentEnv, scope, callStack);
-            const rightVal = evaluateExpression(stmt.test.right, currentEnv, scope, callStack);
-            if (leftVal?.stringValue !== undefined && rightVal?.stringValue !== undefined) {
-              staticCondition = leftVal.stringValue === rightVal.stringValue;
-            }
+        if (stmt.test && stmt.test.type === 'BinaryExpression') {
+          const leftVal = evaluateExpression(stmt.test.left, currentEnv, scope, callStack);
+          const rightVal = evaluateExpression(stmt.test.right, currentEnv, scope, callStack);
+
+          if (leftVal?.stringValue !== undefined && rightVal?.stringValue !== undefined && (stmt.test.operator === '===' || stmt.test.operator === '==')) {
+            staticCondition = leftVal.stringValue === rightVal.stringValue;
+          } else if (leftVal?.numberValue !== undefined && rightVal?.numberValue !== undefined) {
+             const leftNum = leftVal.numberValue;
+             const rightNum = rightVal.numberValue;
+             if (stmt.test.operator === '===') staticCondition = leftNum === rightNum;
+             else if (stmt.test.operator === '==') staticCondition = leftNum == rightNum;
+             else if (stmt.test.operator === '<=') staticCondition = leftNum <= rightNum;
+             else if (stmt.test.operator === '<') staticCondition = leftNum < rightNum;
+             else if (stmt.test.operator === '>') staticCondition = leftNum > rightNum;
+             else if (stmt.test.operator === '>=') staticCondition = leftNum >= rightNum;
+             else if (stmt.test.operator === '!==') staticCondition = leftNum !== rightNum;
+             else if (stmt.test.operator === '!=') staticCondition = leftNum != rightNum;
           }
         }
 

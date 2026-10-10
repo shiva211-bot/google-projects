@@ -1070,8 +1070,8 @@ db.query(qAdmin);`,
     expectedPathSequence: ['SOURCE', 'ARGUMENT', 'PARAMETER', 'RETURN', 'SINK'],
     expectedPostState: {
       input: { isTainted: true, mustExist: true },
-      qAdmin: { isTainted: true, mustExist: true },
-      qPublic: { isTainted: true, mustExist: true },
+      qAdmin: { isTainted: true, mustExist: true, stringValue: 'SELECT * FROM admin WHERE key = ' },
+      qPublic: { isTainted: true, mustExist: true, stringValue: 'SELECT * FROM public WHERE key = ' },
     },
   },
 

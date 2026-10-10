@@ -698,7 +698,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             return cached.returnVal;
           }
           // Bottom of lattice for initial approximation
-          summaryCache.set(cacheKey, { returnVal: null, iterations: 0, converged: false });
+          // Bottom of lattice for initial approximation
           return null;
         }
 
@@ -1412,11 +1412,11 @@ export function runFlowSensitiveInterproceduralAnalysis(
       }
     }
 
-    let iterations = 0;
     let changed = true;
     while (changed && iterations < MAX_ITERATIONS) {
       changed = false;
       iterations++;
+
 
       if (worklist.size === 0) {
         for (const key of summaryCache.keys()) {

@@ -26,7 +26,7 @@ export interface InterproceduralTestCase {
   expectedConvergenceStatus?: AnalysisConvergenceStatus;
   expectedMinSteps?: number;
   expectedPathSequence?: InterproceduralStepType[];
-  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean; mustExist?: boolean }>;
+  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean; mustExist?: boolean; stringValue?: string }>;
 }
 
 export const INTERPROCEDURAL_CORPUS: InterproceduralTestCase[] = [

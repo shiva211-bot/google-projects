@@ -102,6 +102,7 @@ export interface FinalVariableState {
   isTainted: boolean;
   sanitized?: boolean;
   threat?: TaintThreatType;
+  stringValue?: string;
 }
 
 export interface InterproceduralAnalysisResult {

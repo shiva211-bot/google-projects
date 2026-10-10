@@ -26,7 +26,7 @@ export interface InterproceduralTestResult {
   actualPathSequence: InterproceduralStepType[];
   expectedPathSequence?: InterproceduralStepType[];
   finalVariables: Record<string, FinalVariableState>;
-  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean; mustExist?: boolean }>;
+  expectedPostState?: Record<string, { isTainted: boolean; sanitized?: boolean; mustExist?: boolean; stringValue?: string }>;
   classificationVerified: boolean;
   sanitizerVerified: boolean;
   pathSequenceVerified: boolean;
@@ -181,6 +181,13 @@ export function runInterproceduralVerificationSuite(): InterproceduralReport {
             dataFlowStateVerified = false;
             failureReasons.push(
               `State Assertion: Variable '${varName}' sanitized expected ${expectedState.sanitized}, got ${actualState.sanitized}`
+            );
+          }
+
+          if (expectedState.stringValue !== undefined && actualState.stringValue !== expectedState.stringValue) {
+            dataFlowStateVerified = false;
+            failureReasons.push(
+              `State Assertion: Variable '${varName}' stringValue expected '${expectedState.stringValue}', got '${actualState.stringValue}'`
             );
           }
         }

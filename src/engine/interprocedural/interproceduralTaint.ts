@@ -32,6 +32,7 @@ export interface TaintValue {
   isUnresolvedFlow?: boolean;
   unresolvedFunction?: string;
   stringValue?: string; // Statically tracked string literal / constant content
+  numberValue?: number; // Statically tracked numeric constant content (e.g. depth)
 }
 
 // Abstract State Equality comparison across all relevant analysis dimensions
@@ -58,8 +59,9 @@ export function isAbstractStateEqual(a: TaintValue | null, b: TaintValue | null)
   if (a.sanitizerStep?.name !== b.sanitizerStep?.name) return false;
   if (a.sanitizerStep?.neutralizesThreat !== b.sanitizerStep?.neutralizesThreat) return false;
 
-  // Compare statically tracked string constant content (Finding 1)
+  // Compare statically tracked string and numeric constant content
   if (a.stringValue !== b.stringValue) return false;
+  if (a.numberValue !== b.numberValue) return false;
 
   return true;
 }
@@ -341,6 +343,9 @@ export function runFlowSensitiveInterproceduralAnalysis(
             const encodedStr = encodeURIComponent(a.stringValue.slice(0, 64));
             return `str:${encodedStr}`;
           }
+          if (a?.numberValue !== undefined) {
+            return `num:${a.numberValue}`;
+          }
           return 'safe';
         }
         const propsStr = a.properties && a.properties.size > 0 
@@ -365,7 +370,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
     stepsEvaluated++;
     if (!expr) return null;
 
-    // 1. Literal -> Clean. Tracks stringValue if string.
+    // 1. Literal -> Clean. Tracks stringValue or numberValue if literal.
     if (expr.type === 'Literal') {
       if (typeof expr.value === 'string') {
         return {
@@ -374,6 +379,15 @@ export function runFlowSensitiveInterproceduralAnalysis(
           sanitized: false,
           history: [],
           stringValue: expr.value,
+        };
+      }
+      if (typeof expr.value === 'number') {
+        return {
+          isTainted: false,
+          threat: 'UNTRUSTED',
+          sanitized: false,
+          history: [],
+          numberValue: expr.value,
         };
       }
       return null;
@@ -493,26 +507,102 @@ export function runFlowSensitiveInterproceduralAnalysis(
       };
     }
 
-    // 5. BinaryExpression (+): 'SELECT ...' + id
+    // 5. BinaryExpression arithmetic & comparison (+, -, *, /, <=, <, >, >=, ===, ==)
+    if (expr.type === 'BinaryExpression' && ['+', '-', '*', '/', '<=', '<', '>', '>=', '===', '=='].includes(expr.operator)) {
+      if (expr.operator === '+') {
+        const leftVal = evaluateExpression(expr.left, env, scope, callStack);
+        const rightVal = evaluateExpression(expr.right, env, scope, callStack);
+        if (typeof leftVal?.stringValue === 'string' || typeof rightVal?.stringValue === 'string' || leftVal?.isTainted || rightVal?.isTainted) {
+          // Fall through to string concatenation logic below
+        } else {
+          const leftNum = leftVal?.numberValue ?? (expr.left.type === 'Literal' && typeof expr.left.value === 'number' ? expr.left.value : null);
+          const rightNum = rightVal?.numberValue ?? (expr.right.type === 'Literal' && typeof expr.right.value === 'number' ? expr.right.value : null);
+          if (leftNum !== null && rightNum !== null) {
+            return {
+              isTainted: false,
+              threat: 'UNTRUSTED',
+              sanitized: false,
+              history: [],
+              numberValue: leftNum + rightNum,
+            };
+          }
+        }
+      } else {
+        const leftVal = evaluateExpression(expr.left, env, scope, callStack);
+        const rightVal = evaluateExpression(expr.right, env, scope, callStack);
+        const leftNum = leftVal?.numberValue ?? (expr.left.type === 'Literal' && typeof expr.left.value === 'number' ? expr.left.value : null);
+        const rightNum = rightVal?.numberValue ?? (expr.right.type === 'Literal' && typeof expr.right.value === 'number' ? expr.right.value : null);
+
+        if (leftNum !== null && rightNum !== null) {
+          let resNum = 0;
+          let resBool = false;
+          if (expr.operator === '-') resNum = leftNum - rightNum;
+          else if (expr.operator === '*') resNum = leftNum * rightNum;
+          else if (expr.operator === '/') resNum = leftNum / rightNum;
+          else if (expr.operator === '<=') resBool = leftNum <= rightNum;
+          else if (expr.operator === '<') resBool = leftNum < rightNum;
+          else if (expr.operator === '>') resBool = leftNum > rightNum;
+          else if (expr.operator === '>=') resBool = leftNum >= rightNum;
+          else if (expr.operator === '===' || expr.operator === '==') resBool = leftNum === rightNum;
+
+          if (['<=', '<', '>', '>=', '===', '=='].includes(expr.operator)) {
+            return {
+              isTainted: false,
+              threat: 'UNTRUSTED',
+              sanitized: false,
+              history: [],
+              numberValue: resBool ? 1 : 0,
+            };
+          }
+          return {
+            isTainted: false,
+            threat: 'UNTRUSTED',
+            sanitized: false,
+            history: [],
+            numberValue: resNum,
+          };
+        }
+      }
+    }
+
+    // 6. BinaryExpression (+): 'SELECT ...' + id
     if (expr.type === 'BinaryExpression' && expr.operator === '+') {
       const leftVal = evaluateExpression(expr.left, env, scope, callStack);
       const rightVal = evaluateExpression(expr.right, env, scope, callStack);
 
-      if (leftVal && leftVal.isTainted) return leftVal;
-      if (rightVal && rightVal.isTainted) return rightVal;
-
       const leftStr = leftVal?.stringValue;
       const rightStr = rightVal?.stringValue;
-      if (typeof leftStr === 'string' && typeof rightStr === 'string') {
-        return {
-          isTainted: false,
-          threat: 'UNTRUSTED',
-          sanitized: false,
-          history: [],
-          stringValue: leftStr + rightStr,
-        };
+
+      const isTainted = (leftVal?.isTainted || rightVal?.isTainted) ?? false;
+      if (!isTainted) {
+        if (typeof leftStr === 'string' && typeof rightStr === 'string') {
+          return {
+            isTainted: false,
+            threat: 'UNTRUSTED',
+            sanitized: false,
+            history: [],
+            stringValue: leftStr + rightStr,
+          };
+        }
+        return null;
       }
-      return null;
+
+      // At least one side is tainted
+      const taintedSide = leftVal?.isTainted ? leftVal : rightVal!;
+
+      let combinedStr = taintedSide.stringValue;
+      if (typeof leftStr === 'string' && typeof rightStr === 'string') {
+        combinedStr = leftStr + rightStr;
+      } else if (typeof leftStr === 'string' && leftVal && !leftVal.isTainted) {
+        combinedStr = leftStr + (taintedSide.stringValue || '');
+      } else if (typeof rightStr === 'string' && rightVal && !rightVal.isTainted) {
+        combinedStr = (taintedSide.stringValue || '') + rightStr;
+      }
+
+      return {
+        ...taintedSide,
+        stringValue: combinedStr,
+      };
     }
 
     // 6. ObjectExpression: { query: `... ${id}` }
@@ -608,6 +698,13 @@ export function runFlowSensitiveInterproceduralAnalysis(
             return cached.returnVal;
           }
           // Bottom of lattice for initial approximation
+          if (!summaryCache.has(cacheKey)) {
+            summaryCache.set(cacheKey, {
+              returnVal: null,
+              iterations: 0,
+              converged: false,
+            });
+          }
           return null;
         }
 
@@ -964,11 +1061,22 @@ export function runFlowSensitiveInterproceduralAnalysis(
           evaluateExpression(stmt.test, currentEnv, scope, callStack);
         }
 
+        let staticCondition: boolean | null = null;
+        if (stmt.test && stmt.test.type === 'BinaryExpression' && (stmt.test.operator === '===' || stmt.test.operator === '==')) {
+          const leftVal = evaluateExpression(stmt.test.left, currentEnv, scope, callStack);
+          const rightVal = evaluateExpression(stmt.test.right, currentEnv, scope, callStack);
+          const leftStr = leftVal?.stringValue;
+          const rightStr = rightVal?.stringValue;
+          if (typeof leftStr === 'string' && typeof rightStr === 'string') {
+            staticCondition = leftStr === rightStr;
+          }
+        }
+
         const priorEnv = new Map(currentEnv);
 
         // Path 1: Consequent branch evaluated in isolated branch scope
         let ifEnv = new Map(priorEnv);
-        if (stmt.consequent) {
+        if (staticCondition !== false && stmt.consequent) {
           const ifScope = createScope('if_block', scope);
           const ifRes = analyzeBlockStatements(stmt.consequent, new Map(priorEnv), ifScope, callStack);
           ifEnv = ifRes.env;
@@ -982,7 +1090,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         // Path 2: Alternate branch evaluated in isolated branch scope
         // If alternate is omitted, unexecuted path retains prior environment
         let elseEnv = new Map(priorEnv);
-        if (stmt.alternate) {
+        if (staticCondition !== true && stmt.alternate) {
           const elseScope = createScope('else_block', scope);
           const elseRes = analyzeBlockStatements(stmt.alternate, new Map(priorEnv), elseScope, callStack);
           elseEnv = elseRes.env;
@@ -1011,7 +1119,14 @@ export function runFlowSensitiveInterproceduralAnalysis(
             description: `Branch merge: variable '${varKey.split('::')[1]}' flow merged`,
           };
 
-          const mergedVal = joinAbstractValues(valIf || null, valElse || null, branchStep);
+          let mergedVal: TaintValue | null = null;
+          if (staticCondition === true) {
+            mergedVal = valIf || null;
+          } else if (staticCondition === false) {
+            mergedVal = valElse || null;
+          } else {
+            mergedVal = joinAbstractValues(valIf || null, valElse || null, branchStep);
+          }
           currentEnv.set(varKey, mergedVal);
         }
       }
@@ -1321,6 +1436,15 @@ export function runFlowSensitiveInterproceduralAnalysis(
                 history: [],
                 stringValue: decodedStr,
               });
+            } else if (sigVal.startsWith('num:')) {
+              const numVal = Number(sigVal.slice(4));
+              fnEnv.set(pKey, {
+                isTainted: false,
+                threat: 'UNTRUSTED',
+                sanitized: false,
+                history: [],
+                numberValue: numVal,
+              });
             } else if (sigVal !== 'safe') {
               const segments = sigVal.split(':');
               const threat = (segments[0] || 'UNTRUSTED') as TaintThreatType;
@@ -1396,6 +1520,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         isTainted: true,
         sanitized: val.sanitized,
         threat: val.threat,
+        stringValue: val.stringValue,
       };
     } else {
       finalVariables[varName] = {

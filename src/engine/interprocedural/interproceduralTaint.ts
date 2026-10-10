@@ -1505,8 +1505,13 @@ export function runFlowSensitiveInterproceduralAnalysis(
             iterations: recRecord.iterations + 1,
             converged: false,
           });
-          worklist.add(cacheKey);
           changed = true;
+        }
+      }
+
+      if (changed) {
+        for (const key of summaryCache.keys()) {
+          worklist.add(key);
         }
       }
     }

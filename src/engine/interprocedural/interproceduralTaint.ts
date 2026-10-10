@@ -1415,8 +1415,9 @@ export function runFlowSensitiveInterproceduralAnalysis(
     let changed = true;
     while (changed && iterations < MAX_ITERATIONS) {
       changed = false;
+      let sizeGrew = false;
+      let initialCacheSize = summaryCache.size;
       iterations++;
-
 
       if (worklist.size === 0) {
         for (const key of summaryCache.keys()) {
@@ -1500,6 +1501,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         const newVal = res.returnValue;
 
         if (!isAbstractStateEqual(prevVal, newVal)) {
+          if (summaryCache.size > initialCacheSize) sizeGrew = true;
           summaryCache.set(cacheKey, {
             returnVal: newVal,
             iterations: recRecord.iterations + 1,
@@ -1509,7 +1511,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
         }
       }
 
-      if (changed) {
+      if (changed || sizeGrew) {
         for (const key of summaryCache.keys()) {
           worklist.add(key);
         }

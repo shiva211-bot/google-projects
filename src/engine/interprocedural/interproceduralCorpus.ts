@@ -1194,4 +1194,29 @@ res.send('<div>' + safe + '</div>');`,
       safe: { isTainted: true, mustExist: true },
     },
   },
+
+  // =========================================================================
+  // IP-49: Qualified Alias Call on Different Receiver (Unresolved Resolution)
+  // =========================================================================
+  {
+    id: 'IP-49',
+    name: 'Qualified Alias Call on Different Receiver Remains Unresolved',
+    category: 'function_boundary',
+    description: 'When an object defines a method (creating a simple alias for the method name), calling that same method name on a different receiver (otherObj.escapeHtml) must not resolve via alias fallback and remains unresolved.',
+    code: `const objA = {
+  escapeHtml(val) { return 'safe_a'; } // Registers alias escapeHtml -> objA.escapeHtml
+};
+
+const raw = req.query.msg;
+const safe = otherObj.escapeHtml(raw); // Different receiver
+res.send('<div>' + safe + '</div>');`,
+    expectedVulnerable: true,
+    expectedSanitized: false,
+    expectedConfidence: 'unresolved_flow',
+    expectedPathSequence: ['SOURCE', 'PROPAGATION', 'SINK'],
+    expectedPostState: {
+      raw: { isTainted: true, mustExist: true },
+      safe: { isTainted: true, mustExist: true },
+    },
+  },
 ];

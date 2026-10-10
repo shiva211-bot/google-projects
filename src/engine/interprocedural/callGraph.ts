@@ -292,11 +292,14 @@ export class CallGraph {
     const direct = this.functions.get(calleeName);
     if (direct) return direct;
 
-    // 2. Check alias map
-    const aliased = this.aliases.get(calleeName);
-    if (aliased) {
-      const target = this.functions.get(aliased);
-      if (target) return target;
+    // 2. Check alias map. If calleeName is a qualified method call (e.g. "otherObj.escapeHtml"),
+    // do not let a simple method alias (e.g. "escapeHtml" -> "objA.escapeHtml") resolve it falsely.
+    if (!calleeName.includes('.')) {
+      const aliased = this.aliases.get(calleeName);
+      if (aliased) {
+        const target = this.functions.get(aliased);
+        if (target) return target;
+      }
     }
 
     // 3. Qualified method call "receiver.method" requires exact receiver match ("obj.method" or "Class.method").

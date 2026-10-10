@@ -698,7 +698,7 @@ export function runFlowSensitiveInterproceduralAnalysis(
             return cached.returnVal;
           }
           // Bottom of lattice for initial approximation
-          // Bottom of lattice for initial approximation
+          summaryCache.set(cacheKey, { returnVal: null, iterations: 0, converged: false });
           return null;
         }
 
